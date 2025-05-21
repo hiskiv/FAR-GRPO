@@ -305,6 +305,91 @@ class FARTrainer:
             self.ema.restore(model)
 
         self.vae.disable_slicing()
+    
+    @torch.no_grad()
+    def sample_grpo(self, accelerator, train_sampler, train_iter, opt, epoch=0, wandb_logger=None, global_step=0):
+        model = self.accelerator.unwrap_model(self.model)
+
+        if self.ema is not None:
+            self.ema.store(model)
+            self.ema.copy_to(model)
+
+        self.vae.eval()
+        self.vae.enable_slicing()
+        model.eval()
+
+        val_pipeline = build_pipeline(opt['val']['val_pipeline'])(
+            vae=self.vae,
+            transformer=model,
+            scheduler=copy.deepcopy(self.scheduler),
+        )
+        val_pipeline.execution_device = self.accelerator.device
+        val_pipeline.set_progress_bar_config(disable=True)
+
+        samples = []
+        # for batch_idx, batch in enumerate(tqdm(val_dataloader)):
+        for i in tqdm(
+            range(opt['train']['num_batches_per_epoch']),
+            desc=f"Epoch {epoch}: sampling",
+            disable=not accelerator.is_local_main_process,
+            position=0,
+        ):
+            train_sampler.set_epoch(epoch * opt['train']['num_batches_per_epoch'] + i)
+            batch = next(train_iter)
+            num_trajectory = opt['val']['sample_cfg']['sample_trajectory_per_video']
+            gt_video = batch['video'].unsqueeze(1).repeat((1, num_trajectory, 1, 1, 1, 1))
+
+            if 'select_last_frame' in opt['val']['sample_cfg']:
+                gt_video = gt_video[:, :, -opt['val']['sample_cfg']['select_last_frame']:]
+                batch['action'] = batch['action'][:, -opt['val']['sample_cfg']['select_last_frame']:]
+
+            gt_video = rearrange(gt_video, 'b n t c h w -> (b n) t c h w')
+            context_sequence = gt_video[:, :opt['val']['sample_cfg']['context_length']].clone()
+
+            if 'label' in batch:
+                conditions = {'label': batch['label']}
+            elif 'action' in batch:
+                conditions = {'action': batch['action']}
+            else:
+                conditions = None
+
+            input_params = {
+                'conditions': conditions,
+                'context_sequence': context_sequence,
+                'context_timestep_idx': self.context_timestep_idx,
+                'gt_video': gt_video,
+                'unroll_length': opt['val']['sample_cfg']['unroll_length'],
+                'num_inference_steps': opt['val']['sample_cfg']['num_inference_steps'],
+                'guidance_scale': opt['val']['sample_cfg']['guidance_scale'],
+                'sample_size': opt['val']['sample_cfg']['sample_size'],
+                'use_kv_cache': opt['val']['sample_cfg'].get('use_kv_cache', True)
+            }
+
+            samples_iter = val_pipeline.generate_w_logprobs(**input_params)
+            samples = samples + samples_iter
+
+            # pred_video = rearrange(pred_video, '(b n) f c h w -> b n f c h w', n=num_trajectory)
+            # gt_video = rearrange(gt_video, '(b n) f c h w -> b n f c h w', n=num_trajectory)
+
+            # log_paired_video(
+            #     sample=pred_video,
+            #     gt=gt_video,
+            #     context_frames=opt['val']['sample_cfg']['context_length'],
+            #     save_suffix=batch['index'],
+            #     save_dir=os.path.join(opt['path']['visualization'], f'iter_{global_step}'),
+            #     wandb_logger=wandb_logger if batch_idx == 0 else None,  # only log first batch samples
+            #     wandb_cfg={
+            #         'namespace': 'eval_vis',
+            #         'step': global_step,
+            #     },
+            #     annotate_context_frame=opt['val']['sample_cfg'].get('anno_context', True))
+
+        if self.ema is not None:
+            self.ema.restore(model)
+
+        self.vae.disable_slicing()
+
+        return samples
 
     def read_video_folder(self, video_dir, num_trajectory):
         video_path_list = sorted(glob(os.path.join(video_dir, '*.mp4')))
