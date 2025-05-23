@@ -57,14 +57,65 @@ class DistributedKRepeatSampler(Sampler):
                 per_card_samples.append(shuffled_samples[start:end])
             # print(self.rank, 'per_card_samples', per_card_samples[self.rank])
             # 返回当前卡的样本索引
-            yield per_card_samples[self.rank]
+            for i in range(self.batch_size):
+                yield per_card_samples[self.rank][i]
     
     def set_epoch(self, epoch):
         self.epoch = epoch  # 用于同步不同 epoch 的随机状态
 
 
-def samples_aggregating(samples):
-    pass
+def samples_aggregating(accelerator, samples):
+    # I want to aggregate the samples from all the GPUs
+    # And compute the advantage following GRPO formula
+    # The advantage should be computed within the same group (who share the same prompt_ids as shown in the codes of pipeline_far.py)
+    # First gather samples from all devices since rewards are distributed
+    gathered_samples = []
+    for batch_samples in samples:
+        # Gather rewards and prompt_ids from all devices
+        rewards = accelerator.gather(batch_samples['rewards'])  # Shape: (total_batch_size, 1)
+        prompt_ids = accelerator.gather(batch_samples['prompt_ids'])  # Shape: (total_batch_size, seq_len)
+
+        # Create unique identifier for each prompt by hashing the prompt_ids
+        prompt_hashes = torch.sum(prompt_ids, dim=1)  # Shape: (total_batch_size,)
+        
+        # Get unique prompts and their counts
+        unique_prompts, inverse_indices, prompt_counts = torch.unique(
+            prompt_hashes, 
+            return_inverse=True, 
+            return_counts=True
+        )
+        
+        # Initialize tensor to store advantages
+        advantages = torch.zeros_like(rewards)
+        
+        # Compute advantages for each group separately
+        for i in range(len(unique_prompts)):
+            # Get mask for current prompt group
+            mask = (prompt_hashes == unique_prompts[i])
+            group_rewards = rewards[mask]
+            
+            # Compute advantage using GRPO formula for this group
+            # A = (R - mean(R)) / std(R)
+            mean_reward = group_rewards.mean()
+            std_reward = group_rewards.std().clamp(min=1e-6)
+            group_advantages = (group_rewards - mean_reward) / std_reward
+            
+            # Store advantages back in original order
+            advantages[mask] = group_advantages
+
+        # Store advantages in batch samples
+        # batch_samples['advantage'] = advantages
+        
+        # Split back to per-device batches
+        # local_advantages = torch.chunk(advantages, accelerator.num_processes)[accelerator.process_index]
+        batch_samples["advantages"] = (
+            advantages.reshape(accelerator.num_processes, -1, advantages.shape[-1])[accelerator.process_index]
+            .to(accelerator.device)
+        )
+        
+        # batch_samples['advantage'] = local_advantages
+
+    return samples
 
 
 def train(args):
@@ -182,11 +233,11 @@ def train(args):
     for epoch in range(total_iter):
         # batch = next(train_data_yielder)
         """************************* start of an iteration*******************************"""
-        samples = train_pipeline.sample_grpo(accelerator, train_sampler, train_iter, opt, epoch)
+        samples, samples_args = train_pipeline.sample_grpo(accelerator, train_sampler, train_iter, opt, epoch)
         # loss_dict = train_pipeline.train_step(batch, iters=global_step)
         
         # samples processing
-        samples_aggregating(samples)
+        samples = samples_aggregating(accelerator, samples)
         
         # Inner epoch: each samples
         loss_dict = None

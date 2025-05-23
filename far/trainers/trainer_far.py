@@ -327,6 +327,7 @@ class FARTrainer:
         val_pipeline.set_progress_bar_config(disable=True)
 
         samples = []
+        samples_args = []
         # for batch_idx, batch in enumerate(tqdm(val_dataloader)):
         for i in tqdm(
             range(opt['train']['num_batches_per_epoch']),
@@ -365,8 +366,9 @@ class FARTrainer:
                 'use_kv_cache': opt['val']['sample_cfg'].get('use_kv_cache', True)
             }
 
-            samples_iter = val_pipeline.generate_w_logprobs(**input_params)
+            samples_iter, samples_args_iter = val_pipeline.generate_w_logprobs(**input_params)
             samples = samples + samples_iter
+            samples_args = samples_args + samples_args_iter
 
             # pred_video = rearrange(pred_video, '(b n) f c h w -> b n f c h w', n=num_trajectory)
             # gt_video = rearrange(gt_video, '(b n) f c h w -> b n f c h w', n=num_trajectory)
@@ -389,7 +391,7 @@ class FARTrainer:
 
         self.vae.disable_slicing()
 
-        return samples
+        return samples, samples_args
 
     def read_video_folder(self, video_dir, num_trajectory):
         video_path_list = sorted(glob(os.path.join(video_dir, '*.mp4')))

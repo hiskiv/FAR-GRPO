@@ -1,4 +1,5 @@
 export CUDA_VISIBLE_DEVICES=4,5,6,7
+export NCCL_P2P_DISABLE=1
 
 accelerate launch \
     --num_processes 4 \

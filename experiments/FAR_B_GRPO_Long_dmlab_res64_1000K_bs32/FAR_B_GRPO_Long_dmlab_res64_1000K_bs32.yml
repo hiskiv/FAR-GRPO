@@ -1,3 +1,7 @@
+# GENERATE TIME: Thu May 22 15:31:50 2025
+# CMD:
+# train_grpo.py -opt /users/xiaokangliu/projects/FAR-GRPO/options/train/far/long_video_prediction/FAR_B_GRPO_Long_dmlab_res64_1000K_bs32.yml
+
 name: FAR_B_GRPO_Long_dmlab_res64_1000K_bs32
 manual_seed: 0
 mixed_precision: bf16

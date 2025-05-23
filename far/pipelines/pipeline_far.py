@@ -242,7 +242,7 @@ class FARPipeline(DiffusionPipeline):
         num_inference_steps: int = 50,
         sample_size=32,
         batch_size=1,
-        sample_steps=[200], # which autoregressive steps to be used for GRPO training
+        sample_steps=[150, 155], # which autoregressive steps to be used for GRPO training
         use_kv_cache=True,
         output_type: Optional[str] = 'pil',
         return_dict: bool = True,
@@ -274,15 +274,18 @@ class FARPipeline(DiffusionPipeline):
             context_cache = {'is_cache_step': True, 'kv_cache': None, 'cached_seqlen': 0, 'multi_level_cache_init': False}
 
         samples = []
+        samples_args = []
         for step in tqdm(range(current_context_length, current_context_length + unroll_length), disable=not show_progress):
 
+            if step == 160:
+                break
             if conditions is not None and 'action' in conditions:
                 step_condition = {'action': conditions['action'][:, :step + 1]}
             else:
                 step_condition = copy.deepcopy(conditions)
 
             if step in sample_steps:
-                latents, context_cache, all_latents, all_log_probs, all_timesteps, conditions = self.call_w_logprobs(
+                pred_latents, context_cache, all_latents, all_latent_input, all_log_probs, all_timesteps, all_context_cache, step_conditions_out = self.call_w_logprobs(
                     conditions=step_condition,
                     vision_context=latents,
                     context_cache=context_cache,
@@ -291,21 +294,23 @@ class FARPipeline(DiffusionPipeline):
                     num_inference_steps=num_inference_steps,
                     context_timestep_idx=context_timestep_idx)
                 
-                latents = torch.stack(
-                    latents, dim=1
+                all_latents = torch.stack(
+                    all_latents, dim=1
                 )  # (batch_size, num_steps + 1, C, H, W)
-                log_probs = torch.stack(log_probs, dim=1)  # shape after stack (batch_size, num_steps)
+                log_probs = torch.stack(all_log_probs, dim=1)  # shape after stack (batch_size, num_steps)
+                all_latent_input = torch.stack(all_latent_input, dim=1)
                 timesteps = torch.stack(all_timesteps, dim=1) # To be Checked
                 samples.append( #################### TO CHECK: Whether to include context_cache here
                     {
-                        "prompt_ids": context_sequence.view(context_sequence[0], -1)[:, :10], # (batch_size, dim) --> for identify which image this sample corresponds to
+                        "prompt_ids": context_sequence.view(context_sequence.shape[0], -1)[:, :10], # (batch_size, dim) --> for identify which image this sample corresponds to
                         # "prompt_embeds": prompt_embeds,
                         # "pooled_prompt_embeds": pooled_prompt_embeds,
                         "timesteps": timesteps,
-                        "latents": latents[
+                        "latent_input": all_latent_input,
+                        "latents": all_latents[
                             :, :-1
                         ],  # each entry is the latent before timestep t
-                        "next_latents": latents[
+                        "next_latents": all_latents[
                             :, 1:
                         ],  # each entry is the latent after timestep t
                         "log_probs": log_probs,
@@ -313,6 +318,14 @@ class FARPipeline(DiffusionPipeline):
                         # "rewards": rewards,
                     }
                 )
+                samples_args.append(
+                    {
+                        "context_cache": all_context_cache,
+                        "conditions": step_conditions_out,
+                        "step": step
+                    }
+                )
+                # context_cache = new_context_cache.clone()
             else:
                 pred_latents, context_cache = self(
                     conditions=step_condition,
@@ -332,10 +345,10 @@ class FARPipeline(DiffusionPipeline):
         # reward computation
         # reward = torch.zeros((batch_size, 1))
         # reward = (videos - gt_video)
-        reward = -torch.mean((videos - gt_video) ** 2, dim=(1, 2, 3, 4), keepdim=False).unsqueeze(1)
+        reward = -torch.mean((videos - gt_video[:, :160, :, :, :]) ** 2, dim=(1, 2, 3, 4), keepdim=False).unsqueeze(1)
         for sample in samples:
             sample["rewards"] = reward
-        return samples
+        return samples, samples_args
 
     # Adapted from implementation of Flow-GRPO
     @torch.no_grad()
@@ -363,11 +376,14 @@ class FARPipeline(DiffusionPipeline):
             generator (`torch.Generator`, *optional*):
                 A random number generator.
         """
-        step_index = [self.index_for_timestep(t) for t in timestep]
+        device = model_output.device
+        step_index = [scheduler.index_for_timestep(t) for t in timestep]
         prev_step_index = [step+1 for step in step_index]
-        sigma = self.sigmas[step_index].view(-1, 1, 1, 1)
-        sigma_prev = self.sigmas[prev_step_index].view(-1, 1, 1, 1)
-        sigma_max = self.sigmas[1].item()
+        sigma = scheduler.sigmas[step_index].view(-1, 1, 1, 1)
+        sigma_prev = scheduler.sigmas[prev_step_index].view(-1, 1, 1, 1)
+        sigma_max = scheduler.sigmas[1].item()
+        sigma = sigma.to(device)
+        sigma_prev = sigma_prev.to(device)
         dt = sigma_prev - sigma
 
         std_dev_t = torch.sqrt(sigma / (1 - torch.where(sigma == 1, sigma_max, sigma)))*0.7
@@ -452,9 +468,11 @@ class FARPipeline(DiffusionPipeline):
         context_cache['is_cache_step'] = True if vision_context is not None else False
 
         all_latents = [latents]
+        all_latent_input = []
         all_log_probs = []
         all_timesteps = []
         all_kl = []
+        all_context_cache = []
 
         for t in self.progress_bar(self.scheduler.timesteps):
             timesteps = t
@@ -490,6 +508,10 @@ class FARPipeline(DiffusionPipeline):
                 timesteps = torch.cat([context_timesteps, timesteps], dim=-1)
                 latent_model_input = torch.cat([vision_context_input, latent_model_input], dim=1)
 
+            all_context_cache.append(context_cache)
+            all_latent_input.append(latent_model_input)
+            all_timesteps.append(timesteps)
+
             noise_pred, context_cache = self.transformer(
                 latent_model_input,
                 context_cache=context_cache,
@@ -513,12 +535,11 @@ class FARPipeline(DiffusionPipeline):
                 t.unsqueeze(0), 
                 latents.float()
             )
-            prev_latents = latents.clone()
+            prev_latents = latents.clone() # reserved for KL computation
             
             all_latents.append(latents)
             all_log_probs.append(log_prob)
-            all_timesteps.append(timesteps)
 
         # return latents, context_cache
-        return latents, context_cache, all_latents, all_log_probs, all_timesteps, conditions
+        return latents, context_cache, all_latents, all_latent_input, all_log_probs, all_timesteps, all_context_cache, conditions
         

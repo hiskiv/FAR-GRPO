@@ -80,7 +80,7 @@ val:
     num_inference_steps: 50
     sample_size: 8
     sample_trajectory_per_video: 1
-    use_kv_cache: false
+    use_kv_cache: true
   eval_cfg:
     metrics: ['mse', 'psnr', 'ssim', 'fvd', 'lpips']
 
