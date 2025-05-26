@@ -18,7 +18,8 @@
               "--num_machines", "1",
               "--main_process_port", "19040",
               "train_grpo.py",
-              "-opt", "/users/xiaokangliu/projects/FAR-GRPO/options/train/far/long_video_prediction/FAR_B_GRPO_Long_dmlab_res64_1000K_bs32.yml"
+              // "-opt", "/users/xiaokangliu/projects/FAR-GRPO/options/train/far/long_video_prediction/FAR_B_GRPO_Long_dmlab_res64_1000K_bs32.yml"
+              "-opt", "/users/xiaokangliu/projects/FAR-GRPO/options/train/far/long_video_prediction/FAR_M_GRPO_Long_minecraft_res128_1000K_bs32.yml"
             ],
             "justMyCode": false,
             "subProcess": true,

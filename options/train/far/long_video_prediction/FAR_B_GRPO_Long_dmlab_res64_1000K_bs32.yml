@@ -69,7 +69,8 @@ train:
   warmup_iter: 10000
   total_iter: 1000000
   max_grad_norm: 1.0
-
+  adv_clip_max: 5
+  clip_range: 1e-4
   num_batches_per_epoch: 2
 
 # validation settings
@@ -78,7 +79,7 @@ val:
   val_freq: 50000
   sample_cfg:
     context_length: 144
-    unroll_length: 156
+    unroll_length: 56
     guidance_scale: 1.5
     num_inference_steps: 50
     sample_size: 8

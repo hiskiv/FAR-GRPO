@@ -1,4 +1,4 @@
-name: FAR_M_Long_minecraft_res128_1000K_bs32
+name: FAR_M_Long_minecraft_res128_1000K_bs32_GRPO
 manual_seed: 0
 mixed_precision: bf16
 
@@ -12,7 +12,8 @@ datasets:
     data_cfg:
       num_frames: 300
       frame_interval: 1
-    batch_size_per_gpu: 4
+    batch_size_per_gpu: 8
+    num_rollouts_per_prompt: 8 # currently for debug
 
   sample:
     type: MinecraftDataset
@@ -36,7 +37,7 @@ models:
             "num_action_classes": 4
           }
         }
-        pretrained_path: /users/xiaokangliu/models/FAR_M_Long_Minecraft_Action128-4c041561.pth
+      pretrained_path: /users/xiaokangliu/models/FAR_M_Long_Minecraft_Action128-4c041561.pth
     vae:
       type: MyAutoencoderDC
       from_config: options/model_cfg/dcae/model_16x_c32_config.json
@@ -57,7 +58,7 @@ train:
 
   optim_g:
     type: AdamW
-    lr: !!float 1e-4
+    lr: !!float 5e-4
     weight_decay: 0
     betas: [ 0.9, 0.999 ]
 
@@ -65,9 +66,12 @@ train:
   ema_decay: 0.9999
 
   lr_scheduler: constant_with_warmup
-  warmup_iter: 10000
+  warmup_iter: 5000
   total_iter: 1000000
   max_grad_norm: 1.0
+  adv_clip_max: 5
+  clip_range: 5e-4
+  num_batches_per_epoch: 2
 
 # validation settings
 val:
@@ -75,17 +79,19 @@ val:
   val_freq: 50000
   sample_cfg:
     context_length: 144
-    unroll_length: 156
+    unroll_length: 56
+    # unroll_length: 11
     guidance_scale: 1.5
     num_inference_steps: 50
     sample_size: 8
+    sample_steps_interval: 5
     sample_trajectory_per_video: 1
-    use_kv_cache: false
+    use_kv_cache: true
   eval_cfg:
     metrics: ['mse', 'psnr', 'ssim', 'fvd', 'lpips']
 
 # logging settings
 logger:
   print_freq: 100
-  save_checkpoint_freq: !!float 50000
-  use_wandb: false
+  save_checkpoint_freq: !!float 10000
+  use_wandb: true

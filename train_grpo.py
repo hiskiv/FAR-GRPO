@@ -2,7 +2,8 @@ import argparse
 import gc
 import os
 import shutil
-
+from tqdm import tqdm
+import time
 import torch
 import torch.utils.checkpoint
 from torch.utils.data import Dataset, DataLoader, Sampler
@@ -15,6 +16,7 @@ from transformers import get_constant_schedule_with_warmup, get_cosine_schedule_
 from far.data import build_dataset
 from far.trainers import build_trainer
 from far.utils.logger_util import MessageLogger, dict2str, reduce_loss_dict, set_path_logger, setup_wandb
+from far.pipelines.pipeline_far import context_cache_to_device
 
 
 # From FlowGRPO: GRPO Sampler
@@ -37,14 +39,17 @@ class DistributedKRepeatSampler(Sampler):
         while True:
             # 生成确定性的随机序列，确保所有卡同步
             g = torch.Generator()
-            g.manual_seed(self.seed + self.epoch)
-            # print('epoch', self.epoch)
+            # self.epoch += 1
+            g.manual_seed(self.seed + self.epoch + 1)
             # 随机选择m个不同的样本
+            # print('seed', self.seed + self.epoch + 1)
             indices = torch.randperm(len(self.dataset), generator=g)[:self.m].tolist()
+            # print('indices', indices)
             # print(self.rank, 'indices', indices)
             # 每个样本重复k次，生成总样本数n*b
             repeated_indices = [idx for idx in indices for _ in range(self.k)]
             
+            # print('re', repeated_indices)
             # 打乱顺序确保均匀分配
             shuffled_indices = torch.randperm(len(repeated_indices), generator=g).tolist()
             shuffled_samples = [repeated_indices[i] for i in shuffled_indices]
@@ -55,28 +60,34 @@ class DistributedKRepeatSampler(Sampler):
                 start = i * self.batch_size
                 end = start + self.batch_size
                 per_card_samples.append(shuffled_samples[start:end])
+            # print('per', per_card_samples)
             # print(self.rank, 'per_card_samples', per_card_samples[self.rank])
             # 返回当前卡的样本索引
-            for i in range(self.batch_size):
-                yield per_card_samples[self.rank][i]
+            # for idx in per_card_samples[self.rank]:
+            #     yield idx
+            yield per_card_samples[self.rank]
+            # if self.epoch <= 1:
+            #     time.sleep(2)
     
     def set_epoch(self, epoch):
         self.epoch = epoch  # 用于同步不同 epoch 的随机状态
 
 
 def samples_aggregating(accelerator, samples):
-    # I want to aggregate the samples from all the GPUs
-    # And compute the advantage following GRPO formula
-    # The advantage should be computed within the same group (who share the same prompt_ids as shown in the codes of pipeline_far.py)
-    # First gather samples from all devices since rewards are distributed
     gathered_samples = []
+    rewards_mean = 0
+    rewards_std = 0
+    
     for batch_samples in samples:
         # Gather rewards and prompt_ids from all devices
         rewards = accelerator.gather(batch_samples['rewards'])  # Shape: (total_batch_size, 1)
         prompt_ids = accelerator.gather(batch_samples['prompt_ids'])  # Shape: (total_batch_size, seq_len)
-
+        
         # Create unique identifier for each prompt by hashing the prompt_ids
         prompt_hashes = torch.sum(prompt_ids, dim=1)  # Shape: (total_batch_size,)
+        
+        # Round to handle minor float differences (within 1e-4)
+        prompt_hashes = torch.round(prompt_hashes * 1e4) / 1e4
         
         # Get unique prompts and their counts
         unique_prompts, inverse_indices, prompt_counts = torch.unique(
@@ -89,33 +100,51 @@ def samples_aggregating(accelerator, samples):
         advantages = torch.zeros_like(rewards)
         
         # Compute advantages for each group separately
+        # print("prompt_ids", prompt_ids)
+        print('num unique prompts', len(unique_prompts))
         for i in range(len(unique_prompts)):
-            # Get mask for current prompt group
             mask = (prompt_hashes == unique_prompts[i])
             group_rewards = rewards[mask]
             
-            # Compute advantage using GRPO formula for this group
-            # A = (R - mean(R)) / std(R)
-            mean_reward = group_rewards.mean()
-            std_reward = group_rewards.std().clamp(min=1e-6)
-            group_advantages = (group_rewards - mean_reward) / std_reward
+            # Only compute advantages if we have enough samples
+            if len(group_rewards) > 1:
+                mean_reward = group_rewards.mean()
+                # Use a larger epsilon and handle potential numerical instability
+                std_reward = torch.max(group_rewards.std(), torch.tensor(1e-4, device=rewards.device))
+                group_advantages = (group_rewards - mean_reward) / std_reward
+            else:
+                # For single-sample groups, set advantage to 0 or some default value
+                group_advantages = torch.zeros_like(group_rewards)
             
-            # Store advantages back in original order
             advantages[mask] = group_advantages
-
-        # Store advantages in batch samples
-        # batch_samples['advantage'] = advantages
+            
+            # Update global statistics
+            rewards_mean += group_rewards.mean()
+            rewards_std += std_reward
         
-        # Split back to per-device batches
-        # local_advantages = torch.chunk(advantages, accelerator.num_processes)[accelerator.process_index]
-        batch_samples["advantages"] = (
-            advantages.reshape(accelerator.num_processes, -1, advantages.shape[-1])[accelerator.process_index]
-            .to(accelerator.device)
-        )
+        # Check for NaN values before proceeding
+        if torch.isnan(advantages).any():
+            print(f"Warning: NaN values detected in advantages! Group sizes: {prompt_counts.tolist()}")
+            advantages = torch.nan_to_num(advantages, nan=0.0)
         
-        # batch_samples['advantage'] = local_advantages
+        # print("advantages.shape[0], accelerator.num_processes", advantages.shape[0], accelerator.num_processes)
+        # Reshape and distribute back to devices
+        per_device_batch_size = advantages.shape[0] // accelerator.num_processes
+        batch_samples["advantages"] = advantages[
+            accelerator.process_index * per_device_batch_size:
+            (accelerator.process_index + 1) * per_device_batch_size
+        ].to(accelerator.device)
 
-    return samples
+        # print(batch_samples['advantages'])
+    
+    rewards_mean /= len(samples)
+    rewards_std /= len(samples)
+    
+    # Ensure all processes have the same rewards statistics
+    rewards_mean = accelerator.gather(torch.tensor([rewards_mean], device=accelerator.device)).mean()
+    rewards_std = accelerator.gather(torch.tensor([rewards_std], device=accelerator.device)).mean()
+    
+    return samples, rewards_mean, rewards_std
 
 
 def train(args):
@@ -168,7 +197,7 @@ def train(args):
     )
     # No need for shuffle, controlled by sampler
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=trainset_cfg['batch_size_per_gpu'], sampler=train_sampler, drop_last=True, num_workers=8, pin_memory=True)
+        train_dataset, batch_size=1, sampler=train_sampler, num_workers=1, pin_memory=True)
 
     if opt['datasets'].get('sample'):
         sampleset_cfg = opt['datasets']['sample']
@@ -233,76 +262,119 @@ def train(args):
     for epoch in range(total_iter):
         # batch = next(train_data_yielder)
         """************************* start of an iteration*******************************"""
-        samples, samples_args = train_pipeline.sample_grpo(accelerator, train_sampler, train_iter, opt, epoch)
+        samples, samples_args = train_pipeline.sample_grpo(accelerator, train_sampler, train_iter, opt, epoch, global_step=global_step)
+        if global_step <= 1:
+            global_step += 1
+            continue
+        # if global_step <= 3:
+        #     continue
         # loss_dict = train_pipeline.train_step(batch, iters=global_step)
         
         # samples processing
-        samples = samples_aggregating(accelerator, samples)
+        samples, rewards_mean, rewards_std = samples_aggregating(accelerator, samples)
+        log_dict = {'rewards_mean': rewards_mean, 'rewards_std': rewards_std}
+        # msg_logger(log_dict)
+        print(log_dict)
+        if wandb_logger:
+            wandb_logger.log(log_dict, step=global_step)
+
+        train_pipeline.vae.eval()
+        train_pipeline.model.train()
         
-        # Inner epoch: each samples
-        loss_dict = None
-        accelerator.backward(loss_dict['total_loss'])
-
-        if accelerator.sync_gradients:
-            accelerator.clip_grad_norm_(train_pipeline.model.parameters(), opt['train']['max_grad_norm'])
-
-        optimizer.step()
-        lr_scheduler.step()
-        optimizer.zero_grad()
-        """************************* end of an iteration*******************************"""
-
-        # Checks if the accelerator has performed an optimization step behind the scenes
-        if accelerator.sync_gradients:
-
-            if train_pipeline.ema is not None:
-                train_pipeline.ema.step(accelerator.unwrap_model(train_pipeline.model))
-
-            global_step += 1
-
-            if global_step % opt['logger']['print_freq'] == 0:
-
-                log_dict = reduce_loss_dict(accelerator, loss_dict)
-                log_vars = {'iter': global_step}
-                log_vars.update({'lrs': lr_scheduler.get_last_lr()})
-                log_vars.update(log_dict)
+        for i, sample in tqdm(
+            list(enumerate(samples)),
+            desc=f"Epoch {epoch}: training",
+            position=0,
+            disable=not accelerator.is_local_main_process,
+        ):
+            # Zero gradients at the start of each sample
+            optimizer.zero_grad()
+            
+            samples_arg = samples_args[i]
+            for j in range(sample['timesteps'].shape[1]): # how many steps
+                # training pass
+                if j == 0:
+                    context_cache = {'is_cache_step': True, 'kv_cache': None, 'cached_seqlen': 0, 'multi_level_cache_init': False}
+                    context_cache['is_cache_step'] = True
+                else:
+                    context_cache = {'is_cache_step': False, 'kv_cache': None, 'cached_seqlen': 0, 'multi_level_cache_init': False}
+                    
+                loss_dict, context_cache, ratio_mean = train_pipeline.train_step_grpo(sample, samples_arg, j, context_cache, opt, accelerator)
+                ratio_dict = {'ratio_mean': ratio_mean.item()}
                 
-                peak_mem = torch.cuda.max_memory_allocated() / (1024 ** 2)
-                log_vars['peak_mem (MB)'] = round(peak_mem, 2)
+                # Add diagnostic prints
+                # print("Before backward:")
+                # print(f"total_loss: {loss_dict['total_loss'].item()}")
+                # print(f"requires_grad: {loss_dict['total_loss'].requires_grad}")
+                # print(f"loss is nan: {torch.isnan(loss_dict['total_loss']).any()}")
+                # print(f"loss is inf: {torch.isinf(loss_dict['total_loss']).any()}")
                 
-                msg_logger(log_vars)
+                accelerator.backward(loss_dict['total_loss'])
+                # print(list(train_pipeline.model.named_parameters())[25][1].grad.view(-1)[0])
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(train_pipeline.model.parameters(), opt['train']['max_grad_norm'])
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
 
-                if accelerator.is_main_process and wandb_logger:
-                    wandb_log_dict = {
-                        f'train/{k}': v
-                        for k, v in log_vars.items()
-                    }
-                    wandb_log_dict['train/lrs'] = lr_scheduler.get_last_lr()[0]
-                    wandb_logger.log(wandb_log_dict, step=global_step)
-
-            if global_step % opt['val']['val_freq'] == 0 or global_step == total_iter:
-
-                if sample_dataloader is not None:
-                    train_pipeline.sample(sample_dataloader, opt, wandb_logger=wandb_logger, global_step=global_step)
-
+                # Synchronize across all processes
                 accelerator.wait_for_everyone()
 
-                if accelerator.is_main_process and 'eval_cfg' in opt['val']:
-                    result_dict = train_pipeline.eval_performance(opt, global_step=global_step)
-                    logger.info(result_dict)
+                """************************* end of an iteration*******************************"""
 
-                    if wandb_logger:
-                        wandb_log_dict = {
-                            f'eval/{k}': v
-                            for k, v in result_dict.items()
-                        }
-                        wandb_logger.log(wandb_log_dict, step=global_step)
+                # Checks if the accelerator has performed an optimization step behind the scenes
+                if accelerator.sync_gradients:
 
-                accelerator.wait_for_everyone()
-                gc.collect()
-                torch.cuda.empty_cache()
+                    if train_pipeline.ema is not None:
+                        train_pipeline.ema.step(accelerator.unwrap_model(train_pipeline.model))
 
-            if accelerator.is_main_process and (global_step % opt['logger']['save_checkpoint_freq'] == 0 or global_step == total_iter):
-                save_checkpoint(args, logger, accelerator, train_pipeline, global_step, opt['path']['models'])
+                    global_step += 1
+
+                    if global_step % opt['logger']['print_freq'] == 0:
+
+                        print(ratio_dict)
+                        log_dict = reduce_loss_dict(accelerator, loss_dict)
+                        log_vars = {'iter': global_step}
+                        log_vars.update({'lrs': lr_scheduler.get_last_lr()})
+                        log_vars.update(log_dict)
+                        
+                        peak_mem = torch.cuda.max_memory_allocated() / (1024 ** 2)
+                        log_vars['peak_mem (MB)'] = round(peak_mem, 2)
+                        
+                        msg_logger(log_vars)
+
+                        if accelerator.is_main_process and wandb_logger:
+                            wandb_log_dict = {
+                                f'train/{k}': v
+                                for k, v in log_vars.items()
+                            }
+                            wandb_log_dict['train/lrs'] = lr_scheduler.get_last_lr()[0]
+                            wandb_logger.log(wandb_log_dict, step=global_step)
+
+                    if global_step % opt['val']['val_freq'] == 0 or global_step == total_iter:
+
+                        if sample_dataloader is not None:
+                            train_pipeline.sample(sample_dataloader, opt, wandb_logger=wandb_logger, global_step=global_step)
+
+                        accelerator.wait_for_everyone()
+
+                        if accelerator.is_main_process and 'eval_cfg' in opt['val']:
+                            result_dict = train_pipeline.eval_performance(opt, global_step=global_step)
+                            logger.info(result_dict)
+
+                            if wandb_logger:
+                                wandb_log_dict = {
+                                    f'eval/{k}': v
+                                    for k, v in result_dict.items()
+                                }
+                                wandb_logger.log(wandb_log_dict, step=global_step)
+
+                        accelerator.wait_for_everyone()
+                        gc.collect()
+                        torch.cuda.empty_cache()
+
+                    if accelerator.is_main_process and (global_step % opt['logger']['save_checkpoint_freq'] == 0 or global_step == total_iter):
+                        save_checkpoint(args, logger, accelerator, train_pipeline, global_step, opt['path']['models'])
 
 
 def resume_checkpoint(args, accelerator, output_dir, train_pipeline):

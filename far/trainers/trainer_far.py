@@ -18,6 +18,7 @@ from far.metrics.metric import VideoMetric
 from far.models import build_model
 from far.models.autoencoder_dc_model import MyAutoencoderDC
 from far.pipelines import build_pipeline
+from far.pipelines.pipeline_far import sde_step_w_logprob, context_cache_to_device
 from far.utils.ema_util import EMAModel
 from far.utils.registry import TRAINER_REGISTRY
 from far.utils.vis_util import log_paired_video
@@ -234,6 +235,60 @@ class FARTrainer:
 
         return {'total_loss': loss}
 
+    def train_step_grpo(self, sample, sample_args, j, context_cache, opt, accelerator):
+        guidance_scale = opt['val']['sample_cfg']['guidance_scale']
+
+        noise_pred, context_cache_out = self.model(
+            sample['latent_input'][:, j].to(self.model.device),
+            context_cache=context_cache,
+            timestep=sample['timesteps'][:, j].to(self.model.device),
+            conditions=sample_args['conditions'],
+            return_dict=False)
+        noise_pred = noise_pred.to(sample['latent_input'][:, j].dtype)
+
+        # perform guidance
+        if guidance_scale > 1:
+            noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+
+        # compute previous image: x_t -> x_t-1
+        # latents = self.scheduler.step(noise_pred, t, latents).prev_sample
+        self.scheduler.set_timesteps(opt['val']['sample_cfg']['num_inference_steps'])
+        latents, log_prob, prev_latents_mean, std_dev_t = sde_step_w_logprob(
+            self.scheduler, 
+            noise_pred.float(), 
+            sample_args['sde_step_ts'][j].unsqueeze(0),
+            sample['latents'][:, j].to(self.model.device).float(),
+            prev_sample=sample['next_latents'][:, j].to(self.model.device),
+        )
+
+        # print('advantages_mean', sample["advantages"].mean())
+        # print('advantages_device', sample["advantages"].device)
+        
+        # GRPO logic
+        advantages = torch.clamp(
+            sample["advantages"],
+            -opt['train']['adv_clip_max'],
+            opt['train']['adv_clip_max'],
+        )
+        ratio = torch.exp(log_prob - sample["log_probs"][:, j].to(self.model.device))
+        unclipped_loss = -advantages * ratio
+        clipped_loss = -advantages * torch.clamp(
+            ratio,
+            1.0 - opt['train']['clip_range'],
+            1.0 + opt['train']['clip_range'],
+        )
+        policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+        # if opt['train']['beta'] > 0:
+        #     kl_loss = ((prev_latents_mean - sample['next_latents'][:, j]) ** 2).mean(dim=(1,2,3), keepdim=True) / (2 * std_dev_t ** 2)
+        #     kl_loss = torch.mean(kl_loss)
+        #     loss = policy_loss + opt['train']['beta'] * kl_loss
+        # else:
+        loss = policy_loss
+
+        return {'total_loss': loss}, context_cache_out, ratio.mean()
+
+
     @torch.no_grad()
     def sample(self, val_dataloader, opt, wandb_logger=None, global_step=0):
         model = self.accelerator.unwrap_model(self.model)
@@ -338,6 +393,8 @@ class FARTrainer:
             train_sampler.set_epoch(epoch * opt['train']['num_batches_per_epoch'] + i)
             batch = next(train_iter)
             num_trajectory = opt['val']['sample_cfg']['sample_trajectory_per_video']
+            batch['video'] = batch['video'].squeeze(0)
+            batch['action'] = batch['action'].squeeze(0)
             gt_video = batch['video'].unsqueeze(1).repeat((1, num_trajectory, 1, 1, 1, 1))
 
             if 'select_last_frame' in opt['val']['sample_cfg']:
@@ -346,6 +403,9 @@ class FARTrainer:
 
             gt_video = rearrange(gt_video, 'b n t c h w -> (b n) t c h w')
             context_sequence = gt_video[:, :opt['val']['sample_cfg']['context_length']].clone()
+            # print("gt_video", gt_video.view(gt_video.shape[0], -1)[:, :5])
+            if global_step <= 1:
+                continue
 
             if 'label' in batch:
                 conditions = {'label': batch['label']}
@@ -363,6 +423,7 @@ class FARTrainer:
                 'num_inference_steps': opt['val']['sample_cfg']['num_inference_steps'],
                 'guidance_scale': opt['val']['sample_cfg']['guidance_scale'],
                 'sample_size': opt['val']['sample_cfg']['sample_size'],
+                'sample_steps_interval': opt['val']['sample_cfg']['sample_steps_interval'],
                 'use_kv_cache': opt['val']['sample_cfg'].get('use_kv_cache', True)
             }
 
@@ -421,6 +482,13 @@ class FARTrainer:
 
         videos_sample, videos_gt = self.read_video_folder(sample_dir, num_trajectory=opt['val']['sample_cfg']['sample_trajectory_per_video'])
 
+        # Only evaluate on context + unrolled frames since that's what we generate
+        context_length = opt['val']['sample_cfg']['context_length']
+        unroll_length = opt['val']['sample_cfg']['unroll_length'] 
+        total_frames = context_length + unroll_length
+        
+        videos_sample = videos_sample[:, :, :total_frames]
+        videos_gt = videos_gt[:, :, :total_frames]
         logger.info(f'evaluating: sample of shape {videos_sample.shape}, gt of shape {videos_gt.shape}')
-        result_dict = video_metric.compute(videos_sample.contiguous(), videos_gt.contiguous(), context_length=opt['val']['sample_cfg']['context_length'])
+        result_dict = video_metric.compute(videos_sample.contiguous(), videos_gt.contiguous(), context_length=context_length)
         return result_dict

@@ -18,7 +18,8 @@ def random_sample_frames(total_frames, num_frames, interval, split='training'):
         if max_start < 1:
             raise ValueError(f'Cannot sample {num_frames} from {total_frames} with interval {interval}')
         else:
-            start = random.randint(0, max_start - 1)
+            # start = random.randint(0, max_start - 1)
+            start = 0
     else:
         start = 0
         interval = 1 if max_start < 1 else interval
@@ -85,7 +86,37 @@ class MinecraftDataset(Dataset):
             latent, actions = self.read_latent(latent_path, action_path=action_path)
             return {'latent': latent, 'action': actions, 'index': idx}
         else:
-            video_path, action_path = self.data_list[idx]['video_path'], self.data_list[idx]['action_path']
-            video, actions = self.read_video(video_path, action_path=action_path)
-            video = (video / 255.0).float().permute(0, 3, 1, 2).contiguous()
-            return {'video': video, 'action': actions, 'index': idx}
+            if isinstance(idx, list):
+                # Get unique indices while preserving order
+                unique_idx = []
+                for i in idx:
+                    if i not in unique_idx:
+                        unique_idx.append(i)
+
+                # Load each unique video once
+                video_dict = {}
+                action_dict = {}
+                for ids in unique_idx:
+                    video_path, action_path = self.data_list[ids]['video_path'], self.data_list[ids]['action_path']
+                    video, actions = self.read_video(video_path, action_path=action_path)
+                    video = (video / 255.0).float().permute(0, 3, 1, 2).contiguous()
+                    video_dict[ids] = video
+                    action_dict[ids] = actions
+
+                # Arrange tensors in original order
+                videos = []
+                actions_all = []
+                for ids in idx:
+                    video_path, action_path = self.data_list[ids]['video_path'], self.data_list[ids]['action_path']
+                    video, actions = self.read_video(video_path, action_path=action_path)
+                    video = (video / 255.0).float().permute(0, 3, 1, 2).contiguous()
+                    videos.append(video.unsqueeze(0))
+                    actions_all.append(actions.unsqueeze(0))
+                videos = torch.cat(videos, dim=0)
+                actions_all = torch.cat(actions_all, dim=0)
+                return {'video': videos, 'action': actions_all, 'index': idx}
+            else:
+                video_path, action_path = self.data_list[idx]['video_path'], self.data_list[idx]['action_path']
+                video, actions = self.read_video(video_path, action_path=action_path)
+                video = (video / 255.0).float().permute(0, 3, 1, 2).contiguous()
+                return {'video': video, 'action': actions, 'index': idx}

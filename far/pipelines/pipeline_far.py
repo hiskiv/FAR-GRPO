@@ -13,6 +13,83 @@ from tqdm import tqdm
 
 from far.utils.registry import PIPELINE_REGISTRY
 
+def context_cache_to_device(context_cache, device):
+    for i in context_cache['kv_cache']:
+        context_cache['kv_cache'][i]['key'].to(device)
+        context_cache['kv_cache'][i]['value'].to(device)
+        context_cache['kv_cache'][i]['key_all'].to(device)
+        context_cache['kv_cache'][i]['value_all'].to(device)
+    return context_cache
+
+# Adapted from implementation of Flow-GRPO
+def sde_step_w_logprob(
+    scheduler: FlowMatchEulerDiscreteScheduler,
+    model_output: torch.FloatTensor,
+    timestep: Union[float, torch.FloatTensor],
+    sample: torch.FloatTensor,
+    prev_sample: Optional[torch.FloatTensor] = None,
+    generator: Optional[torch.Generator] = None,
+    determistic: bool = False,
+) -> Union[FlowMatchEulerDiscreteSchedulerOutput, Tuple]:
+    """
+    Predict the sample from the previous timestep by reversing the SDE. This function propagates the flow
+    process from the learned model outputs (most often the predicted velocity).
+
+    Args:
+        model_output (`torch.FloatTensor`):
+            The direct output from learned flow model.
+        timestep (`float`):
+            The current discrete timestep in the diffusion chain.
+        sample (`torch.FloatTensor`):
+            A current instance of a sample created by the diffusion process.
+        generator (`torch.Generator`, *optional*):
+            A random number generator.
+    """
+    device = model_output.device
+    step_index = [scheduler.index_for_timestep(t) for t in timestep]
+    prev_step_index = [step+1 for step in step_index]
+    sigma = scheduler.sigmas[step_index].view(-1, 1, 1, 1)
+    sigma_prev = scheduler.sigmas[prev_step_index].view(-1, 1, 1, 1)
+    sigma_max = scheduler.sigmas[1].item()
+    sigma = sigma.to(device)
+    sigma_prev = sigma_prev.to(device)
+    dt = sigma_prev - sigma
+
+    std_dev_t = torch.sqrt(sigma / (1 - torch.where(sigma == 1, sigma_max, sigma)))*0.7
+    
+    # our sde
+    prev_sample_mean = sample*(1+std_dev_t**2/(2*sigma)*dt)+model_output*(1+std_dev_t**2*(1-sigma)/(2*sigma))*dt
+    
+    if prev_sample is not None and generator is not None:
+        raise ValueError(
+            "Cannot pass both generator and prev_sample. Please make sure that either `generator` or"
+            " `prev_sample` stays `None`."
+        )
+
+    if prev_sample is None:
+        variance_noise = randn_tensor(
+            model_output.shape,
+            generator=generator,
+            device=model_output.device,
+            dtype=model_output.dtype,
+        )
+        prev_sample = prev_sample_mean + std_dev_t * torch.sqrt(-1*dt) * variance_noise
+
+    # No noise is added during evaluation
+    if determistic:
+        prev_sample = sample + dt * model_output
+
+    log_prob = (
+        -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * ((std_dev_t * torch.sqrt(-1*dt))**2))
+        - torch.log(std_dev_t * torch.sqrt(-1*dt))
+        - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
+    )
+
+    # mean along all but batch dimension
+    log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+    
+    return prev_sample, log_prob, prev_sample_mean, std_dev_t * torch.sqrt(-1*dt)
+
 
 @PIPELINE_REGISTRY.register()
 class FARPipeline(DiffusionPipeline):
@@ -242,7 +319,7 @@ class FARPipeline(DiffusionPipeline):
         num_inference_steps: int = 50,
         sample_size=32,
         batch_size=1,
-        sample_steps=[150, 155], # which autoregressive steps to be used for GRPO training
+        sample_steps_interval=5, # which autoregressive steps to be used for GRPO training
         use_kv_cache=True,
         output_type: Optional[str] = 'pil',
         return_dict: bool = True,
@@ -277,15 +354,16 @@ class FARPipeline(DiffusionPipeline):
         samples_args = []
         for step in tqdm(range(current_context_length, current_context_length + unroll_length), disable=not show_progress):
 
-            if step == 160:
-                break
+            # if step == 155:
+            #     break
             if conditions is not None and 'action' in conditions:
                 step_condition = {'action': conditions['action'][:, :step + 1]}
             else:
                 step_condition = copy.deepcopy(conditions)
 
-            if step in sample_steps:
-                pred_latents, context_cache, all_latents, all_latent_input, all_log_probs, all_timesteps, all_context_cache, step_conditions_out = self.call_w_logprobs(
+            if (step - current_context_length + 1) % sample_steps_interval == 0:
+                # context_cache_saved = context_cache_to_device(copy.deepcopy(context_cache), 'cpu')
+                pred_latents, context_cache, all_latents, all_latent_input, all_log_probs, all_timesteps, all_sde_step_ts, _, step_conditions_out = self.call_w_logprobs(
                     conditions=step_condition,
                     vision_context=latents,
                     context_cache=context_cache,
@@ -296,13 +374,14 @@ class FARPipeline(DiffusionPipeline):
                 
                 all_latents = torch.stack(
                     all_latents, dim=1
-                )  # (batch_size, num_steps + 1, C, H, W)
-                log_probs = torch.stack(all_log_probs, dim=1)  # shape after stack (batch_size, num_steps)
-                all_latent_input = torch.stack(all_latent_input, dim=1)
-                timesteps = torch.stack(all_timesteps, dim=1) # To be Checked
+                ).to('cpu')  # (batch_size, num_steps + 1, C, H, W)
+                log_probs = torch.stack(all_log_probs, dim=1).to('cpu')  # shape after stack (batch_size, num_steps)
+                all_latent_input = torch.stack(all_latent_input, dim=1).to('cpu')
+                timesteps = torch.stack(all_timesteps, dim=1).to('cpu') # To be Checked
                 samples.append( #################### TO CHECK: Whether to include context_cache here
                     {
-                        "prompt_ids": context_sequence.view(context_sequence.shape[0], -1)[:, :10], # (batch_size, dim) --> for identify which image this sample corresponds to
+                        # BUG: num of different prompt_ids is larger than the number of groups
+                        "prompt_ids": context_sequence.view(context_sequence.shape[0], -1)[:, :5], # (batch_size, dim) --> for identify which image this sample corresponds to
                         # "prompt_embeds": prompt_embeds,
                         # "pooled_prompt_embeds": pooled_prompt_embeds,
                         "timesteps": timesteps,
@@ -320,7 +399,8 @@ class FARPipeline(DiffusionPipeline):
                 )
                 samples_args.append(
                     {
-                        "context_cache": all_context_cache,
+                        # "context_cache": context_cache_saved,
+                        "sde_step_ts": all_sde_step_ts,
                         "conditions": step_conditions_out,
                         "step": step
                     }
@@ -343,83 +423,11 @@ class FARPipeline(DiffusionPipeline):
 
         videos = self.vae_decode(latents)
         # reward computation
-        # reward = torch.zeros((batch_size, 1))
-        # reward = (videos - gt_video)
-        reward = -torch.mean((videos - gt_video[:, :160, :, :, :]) ** 2, dim=(1, 2, 3, 4), keepdim=False).unsqueeze(1)
+        # reward = -torch.mean((videos[:, current_context_length:] - gt_video[:, current_context_length:current_context_length + unroll_length]) ** 2, dim=(1, 2, 3, 4), keepdim=False).unsqueeze(1) # Only the generated frames
+        reward = -torch.mean((videos - gt_video[:, :current_context_length + unroll_length]) ** 2, dim=(1, 2, 3, 4), keepdim=False).unsqueeze(1)
         for sample in samples:
             sample["rewards"] = reward
         return samples, samples_args
-
-    # Adapted from implementation of Flow-GRPO
-    @torch.no_grad()
-    def sde_step_w_logprob(
-        self,
-        scheduler: FlowMatchEulerDiscreteScheduler,
-        model_output: torch.FloatTensor,
-        timestep: Union[float, torch.FloatTensor],
-        sample: torch.FloatTensor,
-        prev_sample: Optional[torch.FloatTensor] = None,
-        generator: Optional[torch.Generator] = None,
-        determistic: bool = False,
-    ) -> Union[FlowMatchEulerDiscreteSchedulerOutput, Tuple]:
-        """
-        Predict the sample from the previous timestep by reversing the SDE. This function propagates the flow
-        process from the learned model outputs (most often the predicted velocity).
-
-        Args:
-            model_output (`torch.FloatTensor`):
-                The direct output from learned flow model.
-            timestep (`float`):
-                The current discrete timestep in the diffusion chain.
-            sample (`torch.FloatTensor`):
-                A current instance of a sample created by the diffusion process.
-            generator (`torch.Generator`, *optional*):
-                A random number generator.
-        """
-        device = model_output.device
-        step_index = [scheduler.index_for_timestep(t) for t in timestep]
-        prev_step_index = [step+1 for step in step_index]
-        sigma = scheduler.sigmas[step_index].view(-1, 1, 1, 1)
-        sigma_prev = scheduler.sigmas[prev_step_index].view(-1, 1, 1, 1)
-        sigma_max = scheduler.sigmas[1].item()
-        sigma = sigma.to(device)
-        sigma_prev = sigma_prev.to(device)
-        dt = sigma_prev - sigma
-
-        std_dev_t = torch.sqrt(sigma / (1 - torch.where(sigma == 1, sigma_max, sigma)))*0.7
-        
-        # our sde
-        prev_sample_mean = sample*(1+std_dev_t**2/(2*sigma)*dt)+model_output*(1+std_dev_t**2*(1-sigma)/(2*sigma))*dt
-        
-        if prev_sample is not None and generator is not None:
-            raise ValueError(
-                "Cannot pass both generator and prev_sample. Please make sure that either `generator` or"
-                " `prev_sample` stays `None`."
-            )
-
-        if prev_sample is None:
-            variance_noise = randn_tensor(
-                model_output.shape,
-                generator=generator,
-                device=model_output.device,
-                dtype=model_output.dtype,
-            )
-            prev_sample = prev_sample_mean + std_dev_t * torch.sqrt(-1*dt) * variance_noise
-
-        # No noise is added during evaluation
-        if determistic:
-            prev_sample = sample + dt * model_output
-
-        log_prob = (
-            -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * ((std_dev_t * torch.sqrt(-1*dt))**2))
-            - torch.log(std_dev_t * torch.sqrt(-1*dt))
-            - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
-        )
-
-        # mean along all but batch dimension
-        log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
-        
-        return prev_sample, log_prob, prev_sample_mean, std_dev_t * torch.sqrt(-1*dt)
     
     @torch.no_grad()
     def call_w_logprobs(
@@ -471,6 +479,7 @@ class FARPipeline(DiffusionPipeline):
         all_latent_input = []
         all_log_probs = []
         all_timesteps = []
+        all_sde_step_ts = []
         all_kl = []
         all_context_cache = []
 
@@ -508,9 +517,11 @@ class FARPipeline(DiffusionPipeline):
                 timesteps = torch.cat([context_timesteps, timesteps], dim=-1)
                 latent_model_input = torch.cat([vision_context_input, latent_model_input], dim=1)
 
-            all_context_cache.append(context_cache)
+            # saved_context_cache = copy.deepcopy(context_cache_to_device(context_cache, 'cpu'))
+            # all_context_cache.append(saved_context_cache)
             all_latent_input.append(latent_model_input)
             all_timesteps.append(timesteps)
+            # context_cache = context_cache_to_device(context_cache, latent_model_input.device)
 
             noise_pred, context_cache = self.transformer(
                 latent_model_input,
@@ -529,7 +540,8 @@ class FARPipeline(DiffusionPipeline):
 
             # compute previous image: x_t -> x_t-1
             # latents = self.scheduler.step(noise_pred, t, latents).prev_sample
-            latents, log_prob, prev_latents_mean, std_dev_t = self.sde_step_w_logprob(
+            all_sde_step_ts.append(t)
+            latents, log_prob, prev_latents_mean, std_dev_t = sde_step_w_logprob(
                 self.scheduler, 
                 noise_pred.float(), 
                 t.unsqueeze(0), 
@@ -541,5 +553,5 @@ class FARPipeline(DiffusionPipeline):
             all_log_probs.append(log_prob)
 
         # return latents, context_cache
-        return latents, context_cache, all_latents, all_latent_input, all_log_probs, all_timesteps, all_context_cache, conditions
+        return latents, context_cache, all_latents, all_latent_input, all_log_probs, all_timesteps, all_sde_step_ts, all_context_cache, conditions
         

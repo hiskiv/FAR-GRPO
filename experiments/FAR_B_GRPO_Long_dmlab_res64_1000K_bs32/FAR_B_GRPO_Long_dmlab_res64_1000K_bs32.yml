@@ -1,4 +1,4 @@
-# GENERATE TIME: Thu May 22 15:31:50 2025
+# GENERATE TIME: Sun May 25 15:56:22 2025
 # CMD:
 # train_grpo.py -opt /users/xiaokangliu/projects/FAR-GRPO/options/train/far/long_video_prediction/FAR_B_GRPO_Long_dmlab_res64_1000K_bs32.yml
 
@@ -73,7 +73,8 @@ train:
   warmup_iter: 10000
   total_iter: 1000000
   max_grad_norm: 1.0
-
+  adv_clip_max: 5
+  clip_range: 1e-4
   num_batches_per_epoch: 2
 
 # validation settings
@@ -82,7 +83,7 @@ val:
   val_freq: 50000
   sample_cfg:
     context_length: 144
-    unroll_length: 156
+    unroll_length: 56
     guidance_scale: 1.5
     num_inference_steps: 50
     sample_size: 8
