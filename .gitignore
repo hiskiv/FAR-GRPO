@@ -13,6 +13,7 @@ __pycache__/
 *$py.class
 wandb
 checkpoint*/
+*.mp4
 
 # C extensions
 *.so

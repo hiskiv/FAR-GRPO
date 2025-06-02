@@ -90,6 +90,8 @@ class FARTrainer:
         self.context_timestep_idx = context_timestep_idx
         self.training_type = training_type
 
+        self.video_metric = VideoMetric(metric=['lpips', 'ssim', 'mse'], device=accelerator.device)
+
     def set_ema_model(self, ema_decay):
         logger = get_logger('far', log_level='INFO')
 
@@ -241,9 +243,12 @@ class FARTrainer:
         noise_pred, context_cache_out = self.model(
             sample['latent_input'][:, j].to(self.model.device),
             context_cache=context_cache,
+            # context_cache=context_cache_to_device(sample['context_cache'][j], self.model.device),
             timestep=sample['timesteps'][:, j].to(self.model.device),
             conditions=sample_args['conditions'],
             return_dict=False)
+        # context_cache_to_device(sample['context_cache'][j], 'cpu')
+        noise_pred = noise_pred[:, -1:, ...]
         noise_pred = noise_pred.to(sample['latent_input'][:, j].dtype)
 
         # perform guidance
@@ -272,25 +277,32 @@ class FARTrainer:
             opt['train']['adv_clip_max'],
         )
         ratio = torch.exp(log_prob - sample["log_probs"][:, j].to(self.model.device))
-        unclipped_loss = -advantages * ratio
+        unclipped_loss = -advantages * ratio.unsqueeze(1)
         clipped_loss = -advantages * torch.clamp(
             ratio,
             1.0 - opt['train']['clip_range'],
             1.0 + opt['train']['clip_range'],
-        )
+        ).unsqueeze(1)
         policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+        # print('advantages', advantages.mean())
+        # print(f'device {self.model.device}, unclipped_loss {unclipped_loss.mean()}, clipped_loss {clipped_loss.mean()}')
         # if opt['train']['beta'] > 0:
         #     kl_loss = ((prev_latents_mean - sample['next_latents'][:, j]) ** 2).mean(dim=(1,2,3), keepdim=True) / (2 * std_dev_t ** 2)
         #     kl_loss = torch.mean(kl_loss)
         #     loss = policy_loss + opt['train']['beta'] * kl_loss
         # else:
         loss = policy_loss
+        clip_frac = torch.mean(
+            (
+                torch.abs(ratio - 1.0) > opt['train']['clip_range']
+            ).float()
+        )
 
-        return {'total_loss': loss}, context_cache_out, ratio.mean()
+        return {'total_loss': loss}, context_cache_out, ratio.mean(), clip_frac
 
 
     @torch.no_grad()
-    def sample(self, val_dataloader, opt, wandb_logger=None, global_step=0):
+    def sample(self, val_dataloader, opt, num_samples=2, wandb_logger=None, global_step=0):
         model = self.accelerator.unwrap_model(self.model)
 
         if self.ema is not None:
@@ -310,14 +322,21 @@ class FARTrainer:
         val_pipeline.set_progress_bar_config(disable=True)
 
         for batch_idx, batch in enumerate(tqdm(val_dataloader)):
+            if batch_idx >= num_samples:
+                break
             num_trajectory = opt['val']['sample_cfg']['sample_trajectory_per_video']
             gt_video = batch['video'].unsqueeze(1).repeat((1, num_trajectory, 1, 1, 1, 1))
+            
+            # batch['video'] = batch['video'].squeeze(0)
+            # batch['action'] = batch['action'].squeeze(0)
+            # gt_video = batch['video'].unsqueeze(1).repeat((1, num_trajectory, 1, 1, 1, 1))
 
             if 'select_last_frame' in opt['val']['sample_cfg']:
                 gt_video = gt_video[:, :, -opt['val']['sample_cfg']['select_last_frame']:]
                 batch['action'] = batch['action'][:, -opt['val']['sample_cfg']['select_last_frame']:]
 
             gt_video = rearrange(gt_video, 'b n t c h w -> (b n) t c h w')
+            gt_video = gt_video[:, :opt['val']['sample_cfg']['context_length'] + opt['val']['sample_cfg']['unroll_length']]
             context_sequence = gt_video[:, :opt['val']['sample_cfg']['context_length']].clone()
 
             if 'label' in batch:
@@ -342,6 +361,9 @@ class FARTrainer:
 
             pred_video = rearrange(pred_video, '(b n) f c h w -> b n f c h w', n=num_trajectory)
             gt_video = rearrange(gt_video, '(b n) f c h w -> b n f c h w', n=num_trajectory)
+
+            # reward = -torch.mean((pred_video - gt_video[:, :]) ** 2, dim=(1, 2, 3, 4, 5), keepdim=False).unsqueeze(1)
+            # print(reward)
 
             log_paired_video(
                 sample=pred_video,
@@ -377,12 +399,16 @@ class FARTrainer:
             vae=self.vae,
             transformer=model,
             scheduler=copy.deepcopy(self.scheduler),
+            video_metric=self.video_metric
         )
         val_pipeline.execution_device = self.accelerator.device
         val_pipeline.set_progress_bar_config(disable=True)
 
         samples = []
         samples_args = []
+        reward_dict = {}
+        g = torch.Generator()
+        g.manual_seed(global_step)
         # for batch_idx, batch in enumerate(tqdm(val_dataloader)):
         for i in tqdm(
             range(opt['train']['num_batches_per_epoch']),
@@ -423,14 +449,16 @@ class FARTrainer:
                 'num_inference_steps': opt['val']['sample_cfg']['num_inference_steps'],
                 'guidance_scale': opt['val']['sample_cfg']['guidance_scale'],
                 'sample_size': opt['val']['sample_cfg']['sample_size'],
-                'sample_steps_interval': opt['val']['sample_cfg']['sample_steps_interval'],
+                'sample_steps_prob': opt['val']['sample_cfg']['sample_steps_prob'],
+                'prob_generator': g,
                 'use_kv_cache': opt['val']['sample_cfg'].get('use_kv_cache', True)
             }
 
-            samples_iter, samples_args_iter = val_pipeline.generate_w_logprobs(**input_params)
+            pred_video, samples_iter, samples_args_iter, reward_dict = val_pipeline.generate_w_logprobs(**input_params)
             samples = samples + samples_iter
             samples_args = samples_args + samples_args_iter
 
+            # gt_video = gt_video[:, :opt['val']['sample_cfg']['context_length'] + opt['val']['sample_cfg']['unroll_length']]
             # pred_video = rearrange(pred_video, '(b n) f c h w -> b n f c h w', n=num_trajectory)
             # gt_video = rearrange(gt_video, '(b n) f c h w -> b n f c h w', n=num_trajectory)
 
@@ -440,7 +468,7 @@ class FARTrainer:
             #     context_frames=opt['val']['sample_cfg']['context_length'],
             #     save_suffix=batch['index'],
             #     save_dir=os.path.join(opt['path']['visualization'], f'iter_{global_step}'),
-            #     wandb_logger=wandb_logger if batch_idx == 0 else None,  # only log first batch samples
+            #     wandb_logger=None,  # only log first batch samples
             #     wandb_cfg={
             #         'namespace': 'eval_vis',
             #         'step': global_step,
@@ -452,7 +480,7 @@ class FARTrainer:
 
         self.vae.disable_slicing()
 
-        return samples, samples_args
+        return samples, samples_args, reward_dict
 
     def read_video_folder(self, video_dir, num_trajectory):
         video_path_list = sorted(glob(os.path.join(video_dir, '*.mp4')))

@@ -1,4 +1,8 @@
-name: v2_FAR_M_Long_minecraft_res128_1000K_bs32_GRPO
+# GENERATE TIME: Mon Jun  2 15:04:10 2025
+# CMD:
+# train_grpo.py -opt /users/xiaokangliu/projects/FAR-GRPO/options/train/far/long_video_prediction/FAR_M_GRPO_Long_minecraft_res128_1000K_bs32.yml
+
+name: v10_FAR_M_Long_minecraft_res128_1000K_bs32_GRPO
 manual_seed: 0
 mixed_precision: bf16
 
@@ -12,7 +16,8 @@ datasets:
     data_cfg:
       num_frames: 300
       frame_interval: 1
-    batch_size_per_gpu: 4
+    batch_size_per_gpu: 8
+    num_rollouts_per_prompt: 8 # currently for debug
 
   sample:
     type: MinecraftDataset
@@ -49,7 +54,7 @@ models:
 
 # path
 path:
-  pretrain_network: /users/xiaokangliu/projects/FAR-GRPO/experiments/v3_FAR_M_Long_minecraft_res128_1000K_bs32_GRPO #/users/xiaokangliu/projects/FAR-GRPO/experiments/FAR_M_Long_minecraft_res128_1000K_bs32_GRPO/
+  pretrain_network: ~
 
 # training settings
 train:
@@ -57,7 +62,7 @@ train:
 
   optim_g:
     type: AdamW
-    lr: !!float 1e-4
+    lr: !!float 1e-5
     weight_decay: 0
     betas: [ 0.9, 0.999 ]
 
@@ -65,21 +70,26 @@ train:
   ema_decay: 0.9999
 
   lr_scheduler: constant_with_warmup
-  warmup_iter: 10000
+  warmup_iter: 5000
   total_iter: 1000000
   max_grad_norm: 1.0
+  adv_clip_max: 5
+  clip_range: 1e-4
+  num_batches_per_epoch: 2
 
 # validation settings
 val:
   val_pipeline: FARPipeline
-  val_freq: 50000
+  val_freq: 5000
+  eval_on_start: false
   sample_cfg:
     context_length: 144
-    # unroll_length: 156
     unroll_length: 56
+    # unroll_length: 11
     guidance_scale: 1.5
     num_inference_steps: 50
     sample_size: 8
+    sample_steps_prob: 0.2
     sample_trajectory_per_video: 1
     use_kv_cache: true
   eval_cfg:
@@ -87,6 +97,6 @@ val:
 
 # logging settings
 logger:
-  print_freq: 100
-  save_checkpoint_freq: !!float 50000
-  use_wandb: false
+  print_freq: 90
+  save_checkpoint_freq: !!float 5000
+  use_wandb: true

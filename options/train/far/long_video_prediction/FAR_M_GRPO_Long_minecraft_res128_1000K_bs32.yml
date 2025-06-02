@@ -1,4 +1,4 @@
-name: FAR_M_Long_minecraft_res128_1000K_bs32_GRPO
+name: v10_FAR_M_Long_minecraft_res128_1000K_bs32_GRPO
 manual_seed: 0
 mixed_precision: bf16
 
@@ -37,7 +37,7 @@ models:
             "num_action_classes": 4
           }
         }
-      pretrained_path: /users/xiaokangliu/models/FAR_M_Long_Minecraft_Action128-4c041561.pth
+        pretrained_path: /users/xiaokangliu/models/FAR_M_Long_Minecraft_Action128-4c041561.pth
     vae:
       type: MyAutoencoderDC
       from_config: options/model_cfg/dcae/model_16x_c32_config.json
@@ -58,7 +58,7 @@ train:
 
   optim_g:
     type: AdamW
-    lr: !!float 5e-4
+    lr: !!float 1e-5
     weight_decay: 0
     betas: [ 0.9, 0.999 ]
 
@@ -70,21 +70,22 @@ train:
   total_iter: 1000000
   max_grad_norm: 1.0
   adv_clip_max: 5
-  clip_range: 5e-4
+  clip_range: 1e-4
   num_batches_per_epoch: 2
 
 # validation settings
 val:
   val_pipeline: FARPipeline
-  val_freq: 50000
+  val_freq: 5000
+  eval_on_start: false
   sample_cfg:
     context_length: 144
-    unroll_length: 56
-    # unroll_length: 11
+    # unroll_length: 56
+    unroll_length: 12
     guidance_scale: 1.5
     num_inference_steps: 50
     sample_size: 8
-    sample_steps_interval: 5
+    sample_steps_prob: 1
     sample_trajectory_per_video: 1
     use_kv_cache: true
   eval_cfg:
@@ -92,6 +93,6 @@ val:
 
 # logging settings
 logger:
-  print_freq: 100
-  save_checkpoint_freq: !!float 10000
+  print_freq: 90
+  save_checkpoint_freq: !!float 5000
   use_wandb: true

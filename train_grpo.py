@@ -87,7 +87,7 @@ def samples_aggregating(accelerator, samples):
         prompt_hashes = torch.sum(prompt_ids, dim=1)  # Shape: (total_batch_size,)
         
         # Round to handle minor float differences (within 1e-4)
-        prompt_hashes = torch.round(prompt_hashes * 1e4) / 1e4
+        # prompt_hashes = torch.round(prompt_hashes * 1e4) / 1e4
         
         # Get unique prompts and their counts
         unique_prompts, inverse_indices, prompt_counts = torch.unique(
@@ -262,7 +262,7 @@ def train(args):
     for epoch in range(total_iter):
         # batch = next(train_data_yielder)
         """************************* start of an iteration*******************************"""
-        samples, samples_args = train_pipeline.sample_grpo(accelerator, train_sampler, train_iter, opt, epoch, global_step=global_step)
+        samples, samples_args, reward_dict = train_pipeline.sample_grpo(accelerator, train_sampler, train_iter, opt, epoch, global_step=global_step)
         if global_step <= 1:
             global_step += 1
             continue
@@ -272,9 +272,14 @@ def train(args):
         
         # samples processing
         samples, rewards_mean, rewards_std = samples_aggregating(accelerator, samples)
-        log_dict = {'rewards_mean': rewards_mean, 'rewards_std': rewards_std}
+        # print('prompt_ids', samples[0]['prompt_ids'].mean(-1))
+        # print('samples[0][rewards]', samples[0]['rewards'])
+        # print('samples[0][advantages]', samples[0]['advantages'])
+        # log_dict = {'rewards_mean': rewards_mean, 'rewards_std': rewards_std, 'lpips': reward_dict['lpips'].mean().item(), 'ssim': reward_dict['ssim'].mean().item()}
+        log_dict = {'rewards_mean': rewards_mean, 'rewards_std': rewards_std, 'mse': reward_dict['mse'].mean().item()}
         # msg_logger(log_dict)
-        print(log_dict)
+        # print(log_dict)
+        # print(reward_dict['mse'].shape)
         if wandb_logger:
             wandb_logger.log(log_dict, step=global_step)
 
@@ -299,8 +304,8 @@ def train(args):
                 else:
                     context_cache = {'is_cache_step': False, 'kv_cache': None, 'cached_seqlen': 0, 'multi_level_cache_init': False}
                     
-                loss_dict, context_cache, ratio_mean = train_pipeline.train_step_grpo(sample, samples_arg, j, context_cache, opt, accelerator)
-                ratio_dict = {'ratio_mean': ratio_mean.item()}
+                loss_dict, context_cache, ratio_mean, clip_frac = train_pipeline.train_step_grpo(sample, samples_arg, j, context_cache, opt, accelerator)
+                ratio_dict = {'ratio_mean': ratio_mean.item(), 'clip_frac': clip_frac.item()}
                 
                 # Add diagnostic prints
                 # print("Before backward:")
@@ -310,7 +315,8 @@ def train(args):
                 # print(f"loss is inf: {torch.isinf(loss_dict['total_loss']).any()}")
                 
                 accelerator.backward(loss_dict['total_loss'])
-                # print(list(train_pipeline.model.named_parameters())[25][1].grad.view(-1)[0])
+                if global_step % opt['logger']['print_freq'] == 0:
+                    print('grads', list(train_pipeline.model.named_parameters())[79][1].grad.view(-1)[0].item(), list(train_pipeline.model.named_parameters())[179][1].grad.view(-1)[0].item(), list(train_pipeline.model.named_parameters())[279][1].grad.view(-1)[0].item())
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(train_pipeline.model.parameters(), opt['train']['max_grad_norm'])
                 optimizer.step()
@@ -333,6 +339,7 @@ def train(args):
                     if global_step % opt['logger']['print_freq'] == 0:
 
                         print(ratio_dict)
+                        # print('log_dict', loss_dict)
                         log_dict = reduce_loss_dict(accelerator, loss_dict)
                         log_vars = {'iter': global_step}
                         log_vars.update({'lrs': lr_scheduler.get_last_lr()})
@@ -348,13 +355,15 @@ def train(args):
                                 f'train/{k}': v
                                 for k, v in log_vars.items()
                             }
+                            wandb_log_dict['train/ratio_mean'] = ratio_dict['ratio_mean']
+                            wandb_log_dict['train/clip_frac'] = ratio_dict['clip_frac']
                             wandb_log_dict['train/lrs'] = lr_scheduler.get_last_lr()[0]
                             wandb_logger.log(wandb_log_dict, step=global_step)
 
-                    if global_step % opt['val']['val_freq'] == 0 or global_step == total_iter:
+                    if global_step % opt['val']['val_freq'] == 0 or global_step == total_iter or (global_step in {2, 3} and opt['val']['eval_on_start']):
 
                         if sample_dataloader is not None:
-                            train_pipeline.sample(sample_dataloader, opt, wandb_logger=wandb_logger, global_step=global_step)
+                            train_pipeline.sample(sample_dataloader, opt, num_samples=2, wandb_logger=wandb_logger, global_step=global_step)
 
                         accelerator.wait_for_everyone()
 

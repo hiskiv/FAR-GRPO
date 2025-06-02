@@ -1,6 +1,7 @@
 import copy
 from typing import Dict, List, Optional, Tuple, Union
 import math
+import random
 
 import torch
 from diffusers.models import AutoencoderKL, AutoencoderKLCogVideoX, DiTTransformer2DModel
@@ -11,15 +12,30 @@ from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from tqdm import tqdm
 
+from far.metrics.metric import VideoMetric
 from far.utils.registry import PIPELINE_REGISTRY
 
 def context_cache_to_device(context_cache, device):
     for i in context_cache['kv_cache']:
-        context_cache['kv_cache'][i]['key'].to(device)
-        context_cache['kv_cache'][i]['value'].to(device)
-        context_cache['kv_cache'][i]['key_all'].to(device)
-        context_cache['kv_cache'][i]['value_all'].to(device)
+        context_cache['kv_cache'][i]['key'] = context_cache['kv_cache'][i]['key'].to(device)
+        context_cache['kv_cache'][i]['value'] = context_cache['kv_cache'][i]['value'].to(device)
+        context_cache['kv_cache'][i]['key_all'] = context_cache['kv_cache'][i]['key_all'].to(device)
+        context_cache['kv_cache'][i]['value_all'] = context_cache['kv_cache'][i]['value_all'].to(device)
     return context_cache
+
+def copy_context_cache(context_cache, device='cpu'):
+    context_cache_copy = {}
+    context_cache_copy['is_cache_step'] = context_cache['is_cache_step']
+    context_cache_copy['cached_seqlen'] = context_cache['cached_seqlen']
+    context_cache_copy['multi_level_cache_init'] = context_cache['multi_level_cache_init']
+    context_cache_copy['kv_cache'] = {}
+    for i in context_cache['kv_cache']:
+        key = copy.deepcopy(context_cache['kv_cache'][i]['key']).to(device)
+        value = copy.deepcopy(context_cache['kv_cache'][i]['value']).to(device)
+        key_all = copy.deepcopy(context_cache['kv_cache'][i]['key_all']).to(device)
+        value_all = copy.deepcopy(context_cache['kv_cache'][i]['value_all']).to(device)
+        context_cache_copy['kv_cache'][i] = {'key': key, 'value': value, 'key_all': key_all, 'value_all': value_all}
+    return context_cache_copy
 
 # Adapted from implementation of Flow-GRPO
 def sde_step_w_logprob(
@@ -100,10 +116,12 @@ class FARPipeline(DiffusionPipeline):
         self,
         transformer: DiTTransformer2DModel,
         vae: AutoencoderKL,
-        scheduler: FlowMatchEulerDiscreteScheduler
+        scheduler: FlowMatchEulerDiscreteScheduler,
+        video_metric: VideoMetric = None
     ):
         super().__init__()
         self.register_modules(transformer=transformer, vae=vae, scheduler=scheduler)
+        self.video_metric = video_metric
 
     def vae_encode(self, context_sequence):
         # normalize: [0, 1] -> [-1, 1]
@@ -316,10 +334,11 @@ class FARPipeline(DiffusionPipeline):
         gt_video=None,
         conditions=None,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        prob_generator: Optional[torch.Generator] = None,
         num_inference_steps: int = 50,
         sample_size=32,
         batch_size=1,
-        sample_steps_interval=5, # which autoregressive steps to be used for GRPO training
+        sample_steps_prob=0.5, # which autoregressive steps to be used for GRPO training
         use_kv_cache=True,
         output_type: Optional[str] = 'pil',
         return_dict: bool = True,
@@ -354,16 +373,15 @@ class FARPipeline(DiffusionPipeline):
         samples_args = []
         for step in tqdm(range(current_context_length, current_context_length + unroll_length), disable=not show_progress):
 
-            # if step == 155:
-            #     break
             if conditions is not None and 'action' in conditions:
                 step_condition = {'action': conditions['action'][:, :step + 1]}
             else:
                 step_condition = copy.deepcopy(conditions)
 
-            if (step - current_context_length + 1) % sample_steps_interval == 0:
+            # if (step - current_context_length + 1) % sample_steps_interval == 0:
+            if prob_generator is not None and torch.rand(1, generator=prob_generator).item() < sample_steps_prob:
                 # context_cache_saved = context_cache_to_device(copy.deepcopy(context_cache), 'cpu')
-                pred_latents, context_cache, all_latents, all_latent_input, all_log_probs, all_timesteps, all_sde_step_ts, _, step_conditions_out = self.call_w_logprobs(
+                pred_latents, context_cache, all_latents, all_latent_input, all_log_probs, all_timesteps, all_sde_step_ts, all_context_cache, step_conditions_out = self.call_w_logprobs(
                     conditions=step_condition,
                     vision_context=latents,
                     context_cache=context_cache,
@@ -393,6 +411,7 @@ class FARPipeline(DiffusionPipeline):
                             :, 1:
                         ],  # each entry is the latent after timestep t
                         "log_probs": log_probs,
+                        "context_cache": all_context_cache,
                         # "kl": kl,
                         # "rewards": rewards,
                     }
@@ -423,11 +442,22 @@ class FARPipeline(DiffusionPipeline):
 
         videos = self.vae_decode(latents)
         # reward computation
-        # reward = -torch.mean((videos[:, current_context_length:] - gt_video[:, current_context_length:current_context_length + unroll_length]) ** 2, dim=(1, 2, 3, 4), keepdim=False).unsqueeze(1) # Only the generated frames
-        reward = -torch.mean((videos - gt_video[:, :current_context_length + unroll_length]) ** 2, dim=(1, 2, 3, 4), keepdim=False).unsqueeze(1)
-        for sample in samples:
-            sample["rewards"] = reward
-        return samples, samples_args
+
+        # MSE reward
+        reward = -torch.mean((videos[:, current_context_length:] - gt_video[:, current_context_length:current_context_length + unroll_length]) ** 2, dim=(1, 2, 3, 4), keepdim=False).unsqueeze(1) # Only the generated frames
+        # reward = -torch.mean((videos - gt_video[:, :current_context_length + unroll_length]) ** 2, dim=(1, 2, 3, 4), keepdim=False).unsqueeze(1) # all frames
+        result_dict = {'mse': reward}
+
+        # FVD reward
+        # result_dict = self.video_metric.compute_reward(videos.unsqueeze(1), gt_video[:, :current_context_length + unroll_length].unsqueeze(1), context_length=current_context_length)
+        # for sample in samples:
+        for i, sample in enumerate(samples):
+        #     # sample["rewards"] = -0.3 * result_dict['lpips'].to(self.execution_device) + 0.7 * result_dict['ssim'].to(self.execution_device)
+        #     # sample["rewards"] = 0.7 * result_dict['ssim'].to(self.execution_device)
+        #     result_dict = {'mse': -torch.mean((videos[:, samples_args[i]['step']:samples_args[i]['step'] + 1] - gt_video[:, samples_args[i]['step']:samples_args[i]['step'] + 1]) ** 2, dim=(1, 2, 3, 4), keepdim=False).unsqueeze(1)}
+            sample["rewards"] = result_dict['mse'].to(self.execution_device)
+
+        return videos, samples, samples_args, result_dict
     
     @torch.no_grad()
     def call_w_logprobs(
@@ -517,8 +547,9 @@ class FARPipeline(DiffusionPipeline):
                 timesteps = torch.cat([context_timesteps, timesteps], dim=-1)
                 latent_model_input = torch.cat([vision_context_input, latent_model_input], dim=1)
 
-            # saved_context_cache = copy.deepcopy(context_cache_to_device(context_cache, 'cpu'))
-            # all_context_cache.append(saved_context_cache)
+            # all_context_cache.append(copy.deepcopy(context_cache_to_device(context_cache, 'cpu')))
+            # all_context_cache.append(context_cache_to_device(copy.deepcopy(context_cache), 'cpu'))
+            # all_context_cache.append(copy_context_cache(context_cache, 'cpu'))
             all_latent_input.append(latent_model_input)
             all_timesteps.append(timesteps)
             # context_cache = context_cache_to_device(context_cache, latent_model_input.device)
@@ -543,7 +574,7 @@ class FARPipeline(DiffusionPipeline):
             all_sde_step_ts.append(t)
             latents, log_prob, prev_latents_mean, std_dev_t = sde_step_w_logprob(
                 self.scheduler, 
-                noise_pred.float(), 
+                noise_pred.float(),
                 t.unsqueeze(0), 
                 latents.float()
             )
