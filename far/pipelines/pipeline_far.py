@@ -342,7 +342,8 @@ class FARPipeline(DiffusionPipeline):
         use_kv_cache=True,
         output_type: Optional[str] = 'pil',
         return_dict: bool = True,
-        show_progress=True
+        show_progress=True,
+        kl_weight=0.01
     ):
         if context_sequence is None:
             current_context_length = 0
@@ -381,14 +382,15 @@ class FARPipeline(DiffusionPipeline):
             # if (step - current_context_length + 1) % sample_steps_interval == 0:
             if prob_generator is not None and torch.rand(1, generator=prob_generator).item() < sample_steps_prob:
                 # context_cache_saved = context_cache_to_device(copy.deepcopy(context_cache), 'cpu')
-                pred_latents, context_cache, all_latents, all_latent_input, all_log_probs, all_timesteps, all_sde_step_ts, all_context_cache, step_conditions_out = self.call_w_logprobs(
+                pred_latents, context_cache, all_latents, all_latent_input, all_log_probs, all_timesteps, all_sde_step_ts, all_context_cache, step_conditions_out, all_kl = self.call_w_logprobs(
                     conditions=step_condition,
                     vision_context=latents,
                     context_cache=context_cache,
                     latents=init_latents[:, step - current_context_length: step - current_context_length + 1],
                     guidance_scale=guidance_scale,
                     num_inference_steps=num_inference_steps,
-                    context_timestep_idx=context_timestep_idx)
+                    context_timestep_idx=context_timestep_idx,
+                    kl_weight=kl_weight)
                 
                 all_latents = torch.stack(
                     all_latents, dim=1
@@ -396,6 +398,7 @@ class FARPipeline(DiffusionPipeline):
                 log_probs = torch.stack(all_log_probs, dim=1).to('cpu')  # shape after stack (batch_size, num_steps)
                 all_latent_input = torch.stack(all_latent_input, dim=1).to('cpu')
                 timesteps = torch.stack(all_timesteps, dim=1).to('cpu') # To be Checked
+                all_kl = torch.stack(all_kl, dim=1).to('cpu')
                 samples.append( #################### TO CHECK: Whether to include context_cache here
                     {
                         # BUG: num of different prompt_ids is larger than the number of groups
@@ -412,15 +415,15 @@ class FARPipeline(DiffusionPipeline):
                         ],  # each entry is the latent after timestep t
                         "log_probs": log_probs,
                         "context_cache": all_context_cache,
-                        # "kl": kl,
+                        "kl": all_kl,
                         # "rewards": rewards,
+                        "sde_step_ts": all_sde_step_ts,
+                        "conditions": step_conditions_out,
                     }
                 )
                 samples_args.append(
                     {
                         # "context_cache": context_cache_saved,
-                        "sde_step_ts": all_sde_step_ts,
-                        "conditions": step_conditions_out,
                         "step": step
                     }
                 )
@@ -444,18 +447,18 @@ class FARPipeline(DiffusionPipeline):
         # reward computation
 
         # MSE reward
-        reward = -torch.mean((videos[:, current_context_length:] - gt_video[:, current_context_length:current_context_length + unroll_length]) ** 2, dim=(1, 2, 3, 4), keepdim=False).unsqueeze(1) # Only the generated frames
+        # reward = -torch.mean((videos[:, current_context_length:] - gt_video[:, current_context_length:current_context_length + unroll_length]) ** 2, dim=(1, 2, 3, 4), keepdim=False).unsqueeze(1) # Only the generated frames
         # reward = -torch.mean((videos - gt_video[:, :current_context_length + unroll_length]) ** 2, dim=(1, 2, 3, 4), keepdim=False).unsqueeze(1) # all frames
-        result_dict = {'mse': reward}
+        # result_dict = {'mse': reward}
 
         # FVD reward
-        # result_dict = self.video_metric.compute_reward(videos.unsqueeze(1), gt_video[:, :current_context_length + unroll_length].unsqueeze(1), context_length=current_context_length)
+        result_dict = self.video_metric.compute_reward(videos.unsqueeze(1), gt_video[:, :current_context_length + unroll_length].unsqueeze(1), context_length=current_context_length)
         # for sample in samples:
         for i, sample in enumerate(samples):
         #     # sample["rewards"] = -0.3 * result_dict['lpips'].to(self.execution_device) + 0.7 * result_dict['ssim'].to(self.execution_device)
-        #     # sample["rewards"] = 0.7 * result_dict['ssim'].to(self.execution_device)
+            sample["rewards"] = result_dict['ssim'].to(self.execution_device)
         #     result_dict = {'mse': -torch.mean((videos[:, samples_args[i]['step']:samples_args[i]['step'] + 1] - gt_video[:, samples_args[i]['step']:samples_args[i]['step'] + 1]) ** 2, dim=(1, 2, 3, 4), keepdim=False).unsqueeze(1)}
-            sample["rewards"] = result_dict['mse'].to(self.execution_device)
+            # sample["rewards"] = result_dict['mse'].to(self.execution_device)
 
         return videos, samples, samples_args, result_dict
     
@@ -471,6 +474,7 @@ class FARPipeline(DiffusionPipeline):
         num_inference_steps: int = 50,
         output_type: Optional[str] = 'pil',
         return_dict: bool = True,
+        kl_weight=0.01
     ) -> Union[ImagePipelineOutput, Tuple]:
 
         batch_size = latents.shape[0]
@@ -554,7 +558,7 @@ class FARPipeline(DiffusionPipeline):
             all_timesteps.append(timesteps)
             # context_cache = context_cache_to_device(context_cache, latent_model_input.device)
 
-            noise_pred, context_cache = self.transformer(
+            noise_pred, context_cache_out = self.transformer(
                 latent_model_input,
                 context_cache=context_cache,
                 timestep=timesteps,
@@ -562,7 +566,7 @@ class FARPipeline(DiffusionPipeline):
                 return_dict=False)
             noise_pred = noise_pred.to(latent_model_input.dtype)
 
-            context_cache['is_cache_step'] = False
+            context_cache_out['is_cache_step'] = False
 
             # perform guidance
             if guidance_scale > 1:
@@ -583,6 +587,37 @@ class FARPipeline(DiffusionPipeline):
             all_latents.append(latents)
             all_log_probs.append(log_prob)
 
+            # KL computation: disable lora adapter --> original model
+            if kl_weight > 0:
+                with self.transformer.disable_adapter():
+                    noise_pred_kl, _ = self.transformer(
+                        latent_model_input,
+                        context_cache=context_cache,
+                        timestep=timesteps,
+                        conditions=conditions,
+                        return_dict=False)
+                    noise_pred_kl = noise_pred_kl.to(latent_model_input.dtype)
+
+                # perform guidance
+                if guidance_scale > 1:
+                    noise_pred_uncond_kl, noise_pred_cond_kl = noise_pred_kl.chunk(2)
+                    noise_pred_kl = noise_pred_uncond_kl + guidance_scale * (noise_pred_cond_kl - noise_pred_uncond_kl)
+
+                # compute previous image: x_t -> x_t-1
+                _, log_prob_kl, prev_latents_mean_kl, std_dev_t_kl = sde_step_w_logprob(
+                    self.scheduler, 
+                    noise_pred_kl.float(),
+                    t.unsqueeze(0), 
+                    latents.float(),
+                    prev_sample=prev_latents.float()
+                )
+                assert std_dev_t == std_dev_t_kl
+                kl = (prev_latents_mean - prev_latents_mean_kl)**2 / (2 * std_dev_t**2)
+                kl = kl.mean(dim=tuple(range(1, kl.ndim)))
+                all_kl.append(kl)
+            
+            context_cache = context_cache_out
+
         # return latents, context_cache
-        return latents, context_cache, all_latents, all_latent_input, all_log_probs, all_timesteps, all_sde_step_ts, all_context_cache, conditions
+        return latents, context_cache, all_latents, all_latent_input, all_log_probs, all_timesteps, all_sde_step_ts, all_context_cache, conditions, all_kl
         

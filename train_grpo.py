@@ -275,8 +275,8 @@ def train(args):
         # print('prompt_ids', samples[0]['prompt_ids'].mean(-1))
         # print('samples[0][rewards]', samples[0]['rewards'])
         # print('samples[0][advantages]', samples[0]['advantages'])
-        # log_dict = {'rewards_mean': rewards_mean, 'rewards_std': rewards_std, 'lpips': reward_dict['lpips'].mean().item(), 'ssim': reward_dict['ssim'].mean().item()}
-        log_dict = {'rewards_mean': rewards_mean, 'rewards_std': rewards_std, 'mse': reward_dict['mse'].mean().item()}
+        log_dict = {'rewards_mean': rewards_mean, 'rewards_std': rewards_std, 'lpips': reward_dict['lpips'].mean().item(), 'ssim': reward_dict['ssim'].mean().item()}
+        # log_dict = {'rewards_mean': rewards_mean, 'rewards_std': rewards_std, 'mse': reward_dict['mse'].mean().item()}
         # msg_logger(log_dict)
         # print(log_dict)
         # print(reward_dict['mse'].shape)
@@ -304,7 +304,7 @@ def train(args):
                 else:
                     context_cache = {'is_cache_step': False, 'kv_cache': None, 'cached_seqlen': 0, 'multi_level_cache_init': False}
                     
-                loss_dict, context_cache, ratio_mean, clip_frac = train_pipeline.train_step_grpo(sample, samples_arg, j, context_cache, opt, accelerator)
+                loss_dict, context_cache, ratio_mean, losses, clip_frac = train_pipeline.train_step_grpo(sample, samples_arg, j, context_cache, opt, accelerator)
                 ratio_dict = {'ratio_mean': ratio_mean.item(), 'clip_frac': clip_frac.item()}
                 
                 # Add diagnostic prints
@@ -315,8 +315,6 @@ def train(args):
                 # print(f"loss is inf: {torch.isinf(loss_dict['total_loss']).any()}")
                 
                 accelerator.backward(loss_dict['total_loss'])
-                if global_step % opt['logger']['print_freq'] == 0:
-                    print('grads', list(train_pipeline.model.named_parameters())[79][1].grad.view(-1)[0].item(), list(train_pipeline.model.named_parameters())[179][1].grad.view(-1)[0].item(), list(train_pipeline.model.named_parameters())[279][1].grad.view(-1)[0].item())
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(train_pipeline.model.parameters(), opt['train']['max_grad_norm'])
                 optimizer.step()
@@ -341,7 +339,8 @@ def train(args):
                         print(ratio_dict)
                         # print('log_dict', loss_dict)
                         log_dict = reduce_loss_dict(accelerator, loss_dict)
-                        log_vars = {'iter': global_step}
+                        losses = reduce_loss_dict(accelerator, losses)
+                        log_vars = {'iter': global_step, 'policy_loss': losses['policy_loss'], 'kl_loss': losses['kl_loss']}
                         log_vars.update({'lrs': lr_scheduler.get_last_lr()})
                         log_vars.update(log_dict)
                         

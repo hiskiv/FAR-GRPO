@@ -147,7 +147,9 @@ class FAR_AttnProcessor2_0:
             attention_mask = attention_mask[:, -query.shape[2]:, :] if attention_mask is not None else None
             query_rotary_emb = (image_rotary_emb[0][-query.shape[2]:, :], image_rotary_emb[1][-query.shape[2]:, :])
         else:  # training
-            query_rotary_emb = image_rotary_emb
+            # query_rotary_emb = image_rotary_emb
+            attention_mask = attention_mask[:, -query.shape[2]:, :] if attention_mask is not None else None
+            query_rotary_emb = (image_rotary_emb[0][-query.shape[2]:, :], image_rotary_emb[1][-query.shape[2]:, :])
 
         if image_rotary_emb is not None:
             query = apply_rotary_emb(query, query_rotary_emb)

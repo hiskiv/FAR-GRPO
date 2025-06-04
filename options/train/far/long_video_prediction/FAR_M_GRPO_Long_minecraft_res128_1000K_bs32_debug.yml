@@ -38,6 +38,13 @@ models:
           }
         }
         pretrained_path: /users/xiaokangliu/models/FAR_M_Long_Minecraft_Action128-4c041561.pth
+      lora_config:
+        r: 8  # LoRA rank
+        alpha: 16  # LoRA scaling factor
+        dropout: 0.1
+        target_modules: ["to_q", "to_k", "to_v", "to_out.0"]  # Target attention modules for LoRA
+        bias: "none"
+        task_type: "FEATURE_EXTRACTION"
     vae:
       type: MyAutoencoderDC
       from_config: options/model_cfg/dcae/model_16x_c32_config.json
@@ -50,7 +57,7 @@ models:
 
 # path
 path:
-  pretrain_network: /users/xiaokangliu/projects/FAR-GRPO/experiments/v10_FAR_M_Long_minecraft_res128_1000K_bs32_GRPO/models
+  pretrain_network: ~ #/users/xiaokangliu/projects/FAR-GRPO/experiments/v10_FAR_M_Long_minecraft_res128_1000K_bs32_GRPO/models
 
 # training settings
 train:
@@ -71,12 +78,14 @@ train:
   max_grad_norm: 1.0
   adv_clip_max: 5
   clip_range: 1e-4
+  kl_weight: 0.01
   num_batches_per_epoch: 1
 
 # validation settings
 val:
   val_pipeline: FARPipeline
   val_freq: 50000
+  eval_on_start: false
   sample_cfg:
     context_length: 144
     # unroll_length: 56
@@ -84,7 +93,7 @@ val:
     guidance_scale: 1.5
     num_inference_steps: 50
     sample_size: 8
-    sample_steps_prob: 0.2
+    sample_steps_prob: 0.5
     sample_trajectory_per_video: 1
     use_kv_cache: true
   eval_cfg:

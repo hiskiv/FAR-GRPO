@@ -13,6 +13,7 @@ from einops import rearrange
 from pytorchvideo.data.encoded_video import EncodedVideo
 from safetensors.torch import load_file
 from tqdm import tqdm
+from peft import get_peft_model, LoraConfig, TaskType
 
 from far.metrics.metric import VideoMetric
 from far.models import build_model
@@ -55,6 +56,20 @@ class FARTrainer:
             if init_cfg.get('pretrained_path'):
                 state_dict = torch.load(init_cfg['pretrained_path'], map_location='cpu', weights_only=True)
                 self.model.load_state_dict(state_dict)
+
+            # Add LoRA if configured
+            if model_cfg['transformer'].get('lora_config'):
+                lora_cfg = model_cfg['transformer']['lora_config']
+                peft_config = LoraConfig(
+                    r=lora_cfg.get('r', 8),
+                    lora_alpha=lora_cfg.get('alpha', 16),
+                    target_modules=lora_cfg.get('target_modules', ["to_q", "to_k", "to_v", "to_out.0"]),
+                    lora_dropout=lora_cfg.get('dropout', 0.0),
+                    bias=lora_cfg.get('bias', "none"),
+                    # task_type=TaskType.OTHER
+                )
+                self.model = get_peft_model(self.model, peft_config)
+                self.model.print_trainable_parameters()
 
         if model_cfg['transformer'].get('gradient_checkpointing'):
             self.model.enable_gradient_checkpointing()
@@ -237,7 +252,8 @@ class FARTrainer:
 
         return {'total_loss': loss}
 
-    def train_step_grpo(self, sample, sample_args, j, context_cache, opt, accelerator):
+    def transformer_step(self, sample, sample_args, j, context_cache, opt, accelerator):
+        # one forward step
         guidance_scale = opt['val']['sample_cfg']['guidance_scale']
 
         noise_pred, context_cache_out = self.model(
@@ -245,7 +261,7 @@ class FARTrainer:
             context_cache=context_cache,
             # context_cache=context_cache_to_device(sample['context_cache'][j], self.model.device),
             timestep=sample['timesteps'][:, j].to(self.model.device),
-            conditions=sample_args['conditions'],
+            conditions=sample['conditions'],
             return_dict=False)
         # context_cache_to_device(sample['context_cache'][j], 'cpu')
         noise_pred = noise_pred[:, -1:, ...]
@@ -262,14 +278,19 @@ class FARTrainer:
         latents, log_prob, prev_latents_mean, std_dev_t = sde_step_w_logprob(
             self.scheduler, 
             noise_pred.float(), 
-            sample_args['sde_step_ts'][j].unsqueeze(0),
+            sample['sde_step_ts'][j].unsqueeze(0),
             sample['latents'][:, j].to(self.model.device).float(),
             prev_sample=sample['next_latents'][:, j].to(self.model.device),
         )
+        return latents, context_cache_out, log_prob, prev_latents_mean, std_dev_t
+    
+    def train_step_grpo(self, sample, sample_args, j, context_cache, opt, accelerator):
+        _, context_cache_out, log_prob, prev_latents_mean, std_dev_t = self.transformer_step(sample, sample_args, j, context_cache, opt, accelerator)
+        if opt['train']['kl_weight'] > 0:
+            with torch.no_grad():
+                with self.model.module.disable_adapter():
+                    _, _, log_prob_kl, prev_latents_mean_kl, std_dev_t_kl = self.transformer_step(sample, sample_args, j, context_cache, opt, accelerator)
 
-        # print('advantages_mean', sample["advantages"].mean())
-        # print('advantages_device', sample["advantages"].device)
-        
         # GRPO logic
         advantages = torch.clamp(
             sample["advantages"],
@@ -283,22 +304,23 @@ class FARTrainer:
             1.0 - opt['train']['clip_range'],
             1.0 + opt['train']['clip_range'],
         ).unsqueeze(1)
-        policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
-        # print('advantages', advantages.mean())
-        # print(f'device {self.model.device}, unclipped_loss {unclipped_loss.mean()}, clipped_loss {clipped_loss.mean()}')
-        # if opt['train']['beta'] > 0:
-        #     kl_loss = ((prev_latents_mean - sample['next_latents'][:, j]) ** 2).mean(dim=(1,2,3), keepdim=True) / (2 * std_dev_t ** 2)
-        #     kl_loss = torch.mean(kl_loss)
-        #     loss = policy_loss + opt['train']['beta'] * kl_loss
-        # else:
-        loss = policy_loss
         clip_frac = torch.mean(
             (
                 torch.abs(ratio - 1.0) > opt['train']['clip_range']
             ).float()
         )
+        
+        policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+        # print('advantages', advantages.mean())
+        # print(f'device {self.model.device}, unclipped_loss {unclipped_loss.mean()}, clipped_loss {clipped_loss.mean()}')
+        if opt['train']['kl_weight'] > 0:
+            kl_loss = ((prev_latents_mean - prev_latents_mean_kl) ** 2).mean(dim=(1,2,3), keepdim=True) / (2 * std_dev_t ** 2)
+            kl_loss = torch.mean(kl_loss)
+            loss = policy_loss + opt['train']['kl_weight'] * kl_loss
+        else:
+            loss = policy_loss
 
-        return {'total_loss': loss}, context_cache_out, ratio.mean(), clip_frac
+        return {'total_loss': loss}, context_cache_out, ratio.mean(), {'policy_loss': policy_loss, 'kl_loss': opt['train']['kl_weight'] * kl_loss}, clip_frac
 
 
     @torch.no_grad()
@@ -451,7 +473,8 @@ class FARTrainer:
                 'sample_size': opt['val']['sample_cfg']['sample_size'],
                 'sample_steps_prob': opt['val']['sample_cfg']['sample_steps_prob'],
                 'prob_generator': g,
-                'use_kv_cache': opt['val']['sample_cfg'].get('use_kv_cache', True)
+                'use_kv_cache': opt['val']['sample_cfg'].get('use_kv_cache', True),
+                'kl_weight': opt['train']['kl_weight']
             }
 
             pred_video, samples_iter, samples_args_iter, reward_dict = val_pipeline.generate_w_logprobs(**input_params)
