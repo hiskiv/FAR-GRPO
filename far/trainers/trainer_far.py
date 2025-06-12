@@ -64,8 +64,9 @@ class FARTrainer:
                     r=lora_cfg.get('r', 8),
                     lora_alpha=lora_cfg.get('alpha', 16),
                     target_modules=lora_cfg.get('target_modules', ["to_q", "to_k", "to_v", "to_out.0"]),
-                    lora_dropout=lora_cfg.get('dropout', 0.0),
-                    bias=lora_cfg.get('bias', "none"),
+                    init_lora_weights="gaussian",
+                    # lora_dropout=lora_cfg.get('dropout', 0.0),
+                    # bias=lora_cfg.get('bias', "none"),
                     # task_type=TaskType.OTHER
                 )
                 self.model = get_peft_model(self.model, peft_config)
@@ -106,6 +107,8 @@ class FARTrainer:
         self.training_type = training_type
 
         self.video_metric = VideoMetric(metric=['lpips', 'ssim', 'mse'], device=accelerator.device)
+
+        self.current_milestone = 500
 
     def set_ema_model(self, ema_decay):
         logger = get_logger('far', log_level='INFO')
@@ -265,7 +268,7 @@ class FARTrainer:
             return_dict=False)
         # context_cache_to_device(sample['context_cache'][j], 'cpu')
         noise_pred = noise_pred[:, -1:, ...]
-        noise_pred = noise_pred.to(sample['latent_input'][:, j].dtype)
+        # noise_pred = noise_pred.to(sample['latent_input'][:, j].dtype)
 
         # perform guidance
         if guidance_scale > 1:
@@ -274,7 +277,7 @@ class FARTrainer:
 
         # compute previous image: x_t -> x_t-1
         # latents = self.scheduler.step(noise_pred, t, latents).prev_sample
-        self.scheduler.set_timesteps(opt['val']['sample_cfg']['num_inference_steps'])
+        # self.scheduler.set_timesteps(opt['val']['sample_cfg']['num_inference_steps'])
         latents, log_prob, prev_latents_mean, std_dev_t = sde_step_w_logprob(
             self.scheduler, 
             noise_pred.float(), 
@@ -285,11 +288,16 @@ class FARTrainer:
         return latents, context_cache_out, log_prob, prev_latents_mean, std_dev_t
     
     def train_step_grpo(self, sample, sample_args, j, context_cache, opt, accelerator):
+        
         _, context_cache_out, log_prob, prev_latents_mean, std_dev_t = self.transformer_step(sample, sample_args, j, context_cache, opt, accelerator)
         if opt['train']['kl_weight'] > 0:
             with torch.no_grad():
-                with self.model.module.disable_adapter():
-                    _, _, log_prob_kl, prev_latents_mean_kl, std_dev_t_kl = self.transformer_step(sample, sample_args, j, context_cache, opt, accelerator)
+                if hasattr(self.model, 'module'):
+                    with self.model.module.disable_adapter():
+                        _, _, log_prob_kl, prev_latents_mean_kl, std_dev_t_kl = self.transformer_step(sample, sample_args, j, context_cache, opt, accelerator)
+                else:
+                    with self.model.disable_adapter():
+                        _, _, log_prob_kl, prev_latents_mean_kl, std_dev_t_kl = self.transformer_step(sample, sample_args, j, context_cache, opt, accelerator)
 
         # GRPO logic
         advantages = torch.clamp(
@@ -314,13 +322,13 @@ class FARTrainer:
         # print('advantages', advantages.mean())
         # print(f'device {self.model.device}, unclipped_loss {unclipped_loss.mean()}, clipped_loss {clipped_loss.mean()}')
         if opt['train']['kl_weight'] > 0:
-            kl_loss = ((prev_latents_mean - prev_latents_mean_kl) ** 2).mean(dim=(1,2,3), keepdim=True) / (2 * std_dev_t ** 2)
+            kl_loss = ((prev_latents_mean - prev_latents_mean_kl) ** 2).mean(dim=(1,2,3,4), keepdim=True) / (2 * std_dev_t ** 2)
             kl_loss = torch.mean(kl_loss)
             loss = policy_loss + opt['train']['kl_weight'] * kl_loss
         else:
             loss = policy_loss
 
-        return {'total_loss': loss}, context_cache_out, ratio.mean(), {'policy_loss': policy_loss, 'kl_loss': opt['train']['kl_weight'] * kl_loss}, clip_frac
+        return {'total_loss': loss}, context_cache_out, ratio.mean(), {'policy_loss': policy_loss, 'kl_loss': kl_loss}, clip_frac
 
 
     @torch.no_grad()
@@ -442,7 +450,10 @@ class FARTrainer:
             batch = next(train_iter)
             num_trajectory = opt['val']['sample_cfg']['sample_trajectory_per_video']
             batch['video'] = batch['video'].squeeze(0)
-            batch['action'] = batch['action'].squeeze(0)
+            if 'action' in batch:
+                batch['action'] = batch['action'].squeeze(0)
+            elif 'label' in batch:
+                batch['label'] = batch['label'].squeeze(0)
             gt_video = batch['video'].unsqueeze(1).repeat((1, num_trajectory, 1, 1, 1, 1))
 
             if 'select_last_frame' in opt['val']['sample_cfg']:
@@ -481,28 +492,32 @@ class FARTrainer:
             samples = samples + samples_iter
             samples_args = samples_args + samples_args_iter
 
-            # gt_video = gt_video[:, :opt['val']['sample_cfg']['context_length'] + opt['val']['sample_cfg']['unroll_length']]
-            # pred_video = rearrange(pred_video, '(b n) f c h w -> b n f c h w', n=num_trajectory)
-            # gt_video = rearrange(gt_video, '(b n) f c h w -> b n f c h w', n=num_trajectory)
+            if global_step > self.current_milestone:
+                gt_video = gt_video[:, :opt['val']['sample_cfg']['context_length'] + opt['val']['sample_cfg']['unroll_length']]
+                pred_video = rearrange(pred_video, '(b n) f c h w -> b n f c h w', n=num_trajectory)
+                gt_video = rearrange(gt_video, '(b n) f c h w -> b n f c h w', n=num_trajectory)
 
-            # log_paired_video(
-            #     sample=pred_video,
-            #     gt=gt_video,
-            #     context_frames=opt['val']['sample_cfg']['context_length'],
-            #     save_suffix=batch['index'],
-            #     save_dir=os.path.join(opt['path']['visualization'], f'iter_{global_step}'),
-            #     wandb_logger=None,  # only log first batch samples
-            #     wandb_cfg={
-            #         'namespace': 'eval_vis',
-            #         'step': global_step,
-            #     },
-            #     annotate_context_frame=opt['val']['sample_cfg'].get('anno_context', True))
+                log_paired_video(
+                    sample=pred_video,
+                    gt=gt_video,
+                    context_frames=opt['val']['sample_cfg']['context_length'],
+                    save_suffix=batch['index'],
+                    save_dir=os.path.join(opt['path']['visualization'], f'iter_{global_step}'),
+                    wandb_logger=None,  # only log first batch samples
+                    wandb_cfg={
+                        'namespace': 'eval_vis',
+                        'step': global_step,
+                    },
+                    annotate_context_frame=opt['val']['sample_cfg'].get('anno_context', True))
+
+                self.current_milestone += 500
 
         if self.ema is not None:
             self.ema.restore(model)
 
         self.vae.disable_slicing()
 
+        # random.shuffle(samples)
         return samples, samples_args, reward_dict
 
     def read_video_folder(self, video_dir, num_trajectory):

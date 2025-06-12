@@ -1,3 +1,7 @@
+# GENERATE TIME: Tue Jun 10 15:36:31 2025
+# CMD:
+# train_grpo.py -opt /users/xiaokangliu/projects/FAR-GRPO/options/train/far/long_video_prediction/FAR_M_GRPO_Long_minecraft_res128_1000K_bs32.yml --resume_from_checkpoint checkpoint-5000
+
 name: lora+kl-v10-ssim-56fr-10steps_FAR_M_Long_minecraft_res128_1000K_bs32_GRPO
 manual_seed: 0
 mixed_precision: bf16

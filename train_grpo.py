@@ -98,6 +98,7 @@ def samples_aggregating(accelerator, samples):
         
         # Initialize tensor to store advantages
         advantages = torch.zeros_like(rewards)
+        rewards_mean_sample = rewards_std_sample = 0
         
         # Compute advantages for each group separately
         # print("prompt_ids", prompt_ids)
@@ -118,9 +119,14 @@ def samples_aggregating(accelerator, samples):
             
             advantages[mask] = group_advantages
             
-            # Update global statistics
-            rewards_mean += group_rewards.mean()
-            rewards_std += std_reward
+            if accelerator.is_main_process:
+                # Update global statistics
+                rewards_mean_sample += mean_reward
+                rewards_std_sample += std_reward
+        
+        if accelerator.is_main_process:
+            rewards_mean += rewards_mean_sample / len(unique_prompts)
+            rewards_std += rewards_std_sample / len(unique_prompts)
         
         # Check for NaN values before proceeding
         if torch.isnan(advantages).any():
@@ -137,12 +143,9 @@ def samples_aggregating(accelerator, samples):
 
         # print(batch_samples['advantages'])
     
-    rewards_mean /= len(samples)
-    rewards_std /= len(samples)
-    
-    # Ensure all processes have the same rewards statistics
-    rewards_mean = accelerator.gather(torch.tensor([rewards_mean], device=accelerator.device)).mean()
-    rewards_std = accelerator.gather(torch.tensor([rewards_std], device=accelerator.device)).mean()
+    if accelerator.is_main_process:
+        rewards_mean /= len(samples)
+        rewards_std /= len(samples)
     
     return samples, rewards_mean, rewards_std
 
@@ -259,9 +262,12 @@ def train(args):
     train_iter = iter(train_dataloader)
 
     # while global_step < total_iter:
-    for epoch in range(total_iter):
+    train_pipeline.vae.eval()
+    start_epoch = 0
+    for epoch in range(start_epoch, total_iter):
         # batch = next(train_data_yielder)
         """************************* start of an iteration*******************************"""
+        train_pipeline.model.eval()
         samples, samples_args, reward_dict = train_pipeline.sample_grpo(accelerator, train_sampler, train_iter, opt, epoch, global_step=global_step)
         if global_step <= 1:
             global_step += 1
@@ -271,19 +277,20 @@ def train(args):
         # loss_dict = train_pipeline.train_step(batch, iters=global_step)
         
         # samples processing
-        samples, rewards_mean, rewards_std = samples_aggregating(accelerator, samples)
+        with torch.no_grad():
+            samples, rewards_mean, rewards_std = samples_aggregating(accelerator, samples)
         # print('prompt_ids', samples[0]['prompt_ids'].mean(-1))
         # print('samples[0][rewards]', samples[0]['rewards'])
         # print('samples[0][advantages]', samples[0]['advantages'])
-        log_dict = {'rewards_mean': rewards_mean, 'rewards_std': rewards_std, 'lpips': reward_dict['lpips'].mean().item(), 'ssim': reward_dict['ssim'].mean().item()}
-        # log_dict = {'rewards_mean': rewards_mean, 'rewards_std': rewards_std, 'mse': reward_dict['mse'].mean().item()}
-        # msg_logger(log_dict)
-        # print(log_dict)
-        # print(reward_dict['mse'].shape)
-        if wandb_logger:
-            wandb_logger.log(log_dict, step=global_step)
+        if accelerator.is_main_process:
+            log_dict = {'rewards_mean': rewards_mean, 'rewards_std': rewards_std, 'lpips': reward_dict['lpips'].mean().item(), 'ssim': reward_dict['ssim'].mean().item()}
+            # log_dict = {'rewards_mean': rewards_mean, 'rewards_std': rewards_std, 'mse': reward_dict['mse'].mean().item()}
+            # msg_logger(log_dict)
+            # print(log_dict)
+            # print(reward_dict['mse'].shape)
+            if wandb_logger:
+                wandb_logger.log(log_dict, step=global_step)
 
-        train_pipeline.vae.eval()
         train_pipeline.model.train()
         
         for i, sample in tqdm(
@@ -296,6 +303,7 @@ def train(args):
             optimizer.zero_grad()
             
             samples_arg = samples_args[i]
+            train_pipeline.scheduler.set_timesteps(opt['val']['sample_cfg']['num_inference_steps'])
             for j in range(sample['timesteps'].shape[1]): # how many steps
                 # training pass
                 if j == 0:
@@ -304,22 +312,23 @@ def train(args):
                 else:
                     context_cache = {'is_cache_step': False, 'kv_cache': None, 'cached_seqlen': 0, 'multi_level_cache_init': False}
                     
-                loss_dict, context_cache, ratio_mean, losses, clip_frac = train_pipeline.train_step_grpo(sample, samples_arg, j, context_cache, opt, accelerator)
-                ratio_dict = {'ratio_mean': ratio_mean.item(), 'clip_frac': clip_frac.item()}
-                
-                # Add diagnostic prints
-                # print("Before backward:")
-                # print(f"total_loss: {loss_dict['total_loss'].item()}")
-                # print(f"requires_grad: {loss_dict['total_loss'].requires_grad}")
-                # print(f"loss is nan: {torch.isnan(loss_dict['total_loss']).any()}")
-                # print(f"loss is inf: {torch.isinf(loss_dict['total_loss']).any()}")
-                
-                accelerator.backward(loss_dict['total_loss'])
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(train_pipeline.model.parameters(), opt['train']['max_grad_norm'])
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+                with accelerator.accumulate(train_pipeline.model):
+                    loss_dict, context_cache, ratio_mean, losses, clip_frac = train_pipeline.train_step_grpo(sample, samples_arg, j, context_cache, opt, accelerator)
+                    ratio_dict = {'ratio_mean': ratio_mean.item(), 'clip_frac': clip_frac.item()}
+                    
+                    # Add diagnostic prints
+                    # print("Before backward:")
+                    # print(f"total_loss: {loss_dict['total_loss'].item()}")
+                    # print(f"requires_grad: {loss_dict['total_loss'].requires_grad}")
+                    # print(f"loss is nan: {torch.isnan(loss_dict['total_loss']).any()}")
+                    # print(f"loss is inf: {torch.isinf(loss_dict['total_loss']).any()}")
+                    
+                    accelerator.backward(loss_dict['total_loss'])
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(train_pipeline.model.parameters(), opt['train']['max_grad_norm'])
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
 
                 # Synchronize across all processes
                 accelerator.wait_for_everyone()
@@ -337,6 +346,11 @@ def train(args):
                     if global_step % opt['logger']['print_freq'] == 0:
 
                         print(ratio_dict)
+                        if accelerator.is_main_process:
+                            print('30', [item for item in list(train_pipeline.model.named_parameters()) if 'lora' in item[0]][30][1].data.view(-1)[0].item())
+                            print('31', [item for item in list(train_pipeline.model.named_parameters()) if 'lora' in item[0]][31][1].data.view(-1)[0].item())
+                            print('30 base', [item for item in list(train_pipeline.model.named_parameters()) if not ('lora' in item[0])][30][1].data.view(-1)[0].item())
+                            print('31 base', [item for item in list(train_pipeline.model.named_parameters()) if not ('lora' in item[0])][31][1].data.view(-1)[0].item())
                         # print('log_dict', loss_dict)
                         log_dict = reduce_loss_dict(accelerator, loss_dict)
                         losses = reduce_loss_dict(accelerator, losses)

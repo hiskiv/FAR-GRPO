@@ -20,7 +20,8 @@ def random_sample_frames(total_frames, num_frames, interval, split='training'):
             start = 0
             interval = 1
         else:
-            start = random.randint(0, max_start - 1)
+            # start = random.randint(0, max_start - 1)
+            start = 0
     else:
         start = 0
         if max_start < 1:
@@ -72,7 +73,7 @@ class UCFDataset(Dataset):
         if self.split == 'training':
             self.transform = transforms.Compose([
                 transforms.Resize(self.data_cfg['resolution']),
-                transforms.RandomCrop(self.data_cfg['resolution'])
+                transforms.CenterCrop(self.data_cfg['resolution'])
             ])
         else:
             if self.data_cfg['evaluation_type'] == 'MCVD':
@@ -124,13 +125,50 @@ class UCFDataset(Dataset):
         if self.use_latent:
             raise NotImplementedError
         else:
-            video_path, label = self.data_list[idx]['video_path'], self.data_list[idx]['label']
-            video = self.read_video(video_path)
+            # video_path, label = self.data_list[idx]['video_path'], self.data_list[idx]['label']
+            # video = self.read_video(video_path)
 
-            video = (video / 255.0).float().permute(0, 3, 1, 2).contiguous()
-            video = self.transform(video)
+            # video = (video / 255.0).float().permute(0, 3, 1, 2).contiguous()
+            # video = self.transform(video)
 
-            if self.data_cfg.get('use_flip') and random.random() < 0.5:
-                video = torch.flip(video, dims=(3, ))
+            # if self.data_cfg.get('use_flip') and random.random() < 0.5:
+            #     video = torch.flip(video, dims=(3, ))
 
-            return {'video': video, 'label': label, 'index': idx}
+            # return {'video': video, 'label': label, 'index': idx}
+            if isinstance(idx, list):
+                # Get unique indices while preserving order
+                # unique_idx = []
+                # for i in idx:
+                #     if i not in unique_idx:
+                #         unique_idx.append(i)
+
+                # # Load each unique video once
+                # video_dict = {}
+                # action_dict = {}
+                # for ids in unique_idx:
+                #     video_path, label = self.data_list[ids]['video_path'], self.data_list[ids]['label']
+                #     video = self.read_video(video_path)
+                #     video = (video / 255.0).float().permute(0, 3, 1, 2).contiguous()
+                #     video_dict[ids] = video
+
+                # Arrange tensors in original order
+                videos = []
+                for ids in idx:
+                    video_path, label = self.data_list[ids]['video_path'], self.data_list[ids]['label']
+                    video = self.read_video(video_path)
+                    video = (video / 255.0).float().permute(0, 3, 1, 2).contiguous()
+                    video = self.transform(video)
+                    # if self.data_cfg.get('use_flip') and random.random() < 0.5:
+                    #     video = torch.flip(video, dims=(3, ))
+                    videos.append(video.unsqueeze(0))
+                videos = torch.cat(videos, dim=0)
+                return {'video': videos, 'label': label, 'index': idx}
+            else:
+                video_path, label = self.data_list[idx]['video_path'], self.data_list[idx]['label']
+                video = self.read_video(video_path)
+                video = (video / 255.0).float().permute(0, 3, 1, 2).contiguous()
+                video = self.transform(video)
+                # if self.data_cfg.get('use_flip') and random.random() < 0.5:
+                #     video = torch.flip(video, dims=(3, ))
+                return {'video': video, 'label': label, 'index': idx}
+        

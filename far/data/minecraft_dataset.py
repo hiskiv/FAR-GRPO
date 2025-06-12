@@ -88,20 +88,20 @@ class MinecraftDataset(Dataset):
         else:
             if isinstance(idx, list):
                 # Get unique indices while preserving order
-                unique_idx = []
-                for i in idx:
-                    if i not in unique_idx:
-                        unique_idx.append(i)
+                # unique_idx = []
+                # for i in idx:
+                #     if i not in unique_idx:
+                #         unique_idx.append(i)
 
                 # Load each unique video once
-                video_dict = {}
-                action_dict = {}
-                for ids in unique_idx:
-                    video_path, action_path = self.data_list[ids]['video_path'], self.data_list[ids]['action_path']
-                    video, actions = self.read_video(video_path, action_path=action_path)
-                    video = (video / 255.0).float().permute(0, 3, 1, 2).contiguous()
-                    video_dict[ids] = video
-                    action_dict[ids] = actions
+                # video_dict = {}
+                # action_dict = {}
+                # for ids in unique_idx:
+                #     video_path, action_path = self.data_list[ids]['video_path'], self.data_list[ids]['action_path']
+                #     video, actions = self.read_video(video_path, action_path=action_path)
+                #     video = (video / 255.0).float().permute(0, 3, 1, 2).contiguous()
+                #     video_dict[ids] = video
+                #     action_dict[ids] = actions
 
                 # Arrange tensors in original order
                 videos = []

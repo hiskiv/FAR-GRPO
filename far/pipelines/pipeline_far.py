@@ -64,8 +64,8 @@ def sde_step_w_logprob(
     device = model_output.device
     step_index = [scheduler.index_for_timestep(t) for t in timestep]
     prev_step_index = [step+1 for step in step_index]
-    sigma = scheduler.sigmas[step_index].view(-1, 1, 1, 1)
-    sigma_prev = scheduler.sigmas[prev_step_index].view(-1, 1, 1, 1)
+    sigma = scheduler.sigmas[step_index].view(-1, 1, 1, 1, 1)
+    sigma_prev = scheduler.sigmas[prev_step_index].view(-1, 1, 1, 1, 1)
     sigma_max = scheduler.sigmas[1].item()
     sigma = sigma.to(device)
     sigma_prev = sigma_prev.to(device)
@@ -399,10 +399,12 @@ class FARPipeline(DiffusionPipeline):
                 all_latent_input = torch.stack(all_latent_input, dim=1).to('cpu')
                 timesteps = torch.stack(all_timesteps, dim=1).to('cpu') # To be Checked
                 all_kl = torch.stack(all_kl, dim=1).to('cpu')
+                
+                context_slice = [1, 512, 1024, 2048, 3072, 4096, 5120, 6144, 8192, 10003]
                 samples.append( #################### TO CHECK: Whether to include context_cache here
                     {
                         # BUG: num of different prompt_ids is larger than the number of groups
-                        "prompt_ids": context_sequence.view(context_sequence.shape[0], -1)[:, :5], # (batch_size, dim) --> for identify which image this sample corresponds to
+                        "prompt_ids": context_sequence.view(context_sequence.shape[0], -1)[:, context_slice], # (batch_size, dim) --> for identify which image this sample corresponds to
                         # "prompt_embeds": prompt_embeds,
                         # "pooled_prompt_embeds": pooled_prompt_embeds,
                         "timesteps": timesteps,
@@ -520,6 +522,7 @@ class FARPipeline(DiffusionPipeline):
         for t in self.progress_bar(self.scheduler.timesteps):
             timesteps = t
 
+            latents_ori = latents.clone()
             latent_model_input = torch.cat([latents] * 2) if guidance_scale > 1 else latents
             if guidance_scale > 1 and vision_context is not None:
                 vision_context_input = torch.cat([vision_context] * 2)
@@ -589,31 +592,32 @@ class FARPipeline(DiffusionPipeline):
 
             # KL computation: disable lora adapter --> original model
             if kl_weight > 0:
-                with self.transformer.disable_adapter():
-                    noise_pred_kl, _ = self.transformer(
-                        latent_model_input,
-                        context_cache=context_cache,
-                        timestep=timesteps,
-                        conditions=conditions,
-                        return_dict=False)
-                    noise_pred_kl = noise_pred_kl.to(latent_model_input.dtype)
+                # with self.transformer.disable_adapter():
+                #     noise_pred_kl, _ = self.transformer(
+                #         latent_model_input,
+                #         context_cache=context_cache,
+                #         timestep=timesteps,
+                #         conditions=conditions,
+                #         return_dict=False)
+                #     noise_pred_kl = noise_pred_kl.to(latent_model_input.dtype)
 
-                # perform guidance
-                if guidance_scale > 1:
-                    noise_pred_uncond_kl, noise_pred_cond_kl = noise_pred_kl.chunk(2)
-                    noise_pred_kl = noise_pred_uncond_kl + guidance_scale * (noise_pred_cond_kl - noise_pred_uncond_kl)
+                # # perform guidance
+                # if guidance_scale > 1:
+                #     noise_pred_uncond_kl, noise_pred_cond_kl = noise_pred_kl.chunk(2)
+                #     noise_pred_kl = noise_pred_uncond_kl + guidance_scale * (noise_pred_cond_kl - noise_pred_uncond_kl)
 
-                # compute previous image: x_t -> x_t-1
-                _, log_prob_kl, prev_latents_mean_kl, std_dev_t_kl = sde_step_w_logprob(
-                    self.scheduler, 
-                    noise_pred_kl.float(),
-                    t.unsqueeze(0), 
-                    latents.float(),
-                    prev_sample=prev_latents.float()
-                )
-                assert std_dev_t == std_dev_t_kl
-                kl = (prev_latents_mean - prev_latents_mean_kl)**2 / (2 * std_dev_t**2)
-                kl = kl.mean(dim=tuple(range(1, kl.ndim)))
+                # # compute previous image: x_t -> x_t-1
+                # _, log_prob_kl, prev_latents_mean_kl, std_dev_t_kl = sde_step_w_logprob(
+                #     self.scheduler, 
+                #     noise_pred_kl.float(),
+                #     t.unsqueeze(0), 
+                #     latents_ori.float(),
+                #     prev_sample=prev_latents.float()
+                # )
+                # assert std_dev_t == std_dev_t_kl
+                # kl = (prev_latents_mean - prev_latents_mean_kl)**2 / (2 * std_dev_t**2)
+                # kl = kl.mean(dim=tuple(range(1, kl.ndim)))
+                kl = torch.zeros_like(log_prob)
                 all_kl.append(kl)
             
             context_cache = context_cache_out

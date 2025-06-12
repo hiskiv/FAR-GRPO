@@ -1,4 +1,8 @@
-name: lora+kl-v10-ssim-56fr-10steps_FAR_M_Long_minecraft_res128_1000K_bs32_GRPO
+# GENERATE TIME: Sat Jun  7 10:31:08 2025
+# CMD:
+# train_grpo.py -opt /users/xiaokangliu/projects/FAR-GRPO/options/train/far/long_video_prediction/FAR_M_GRPO_Long_minecraft_res128_1000K_bs32.yml
+
+name: lora+kl-v9-fullmse-56fr-10steps_FAR_M_Long_minecraft_res128_1000K_bs32_GRPO
 manual_seed: 0
 mixed_precision: bf16
 
@@ -65,7 +69,7 @@ train:
 
   optim_g:
     type: AdamW
-    lr: !!float 1e-4
+    lr: !!float 1e-3
     weight_decay: 1e-4
     betas: [ 0.9, 0.999 ]
 
@@ -77,8 +81,8 @@ train:
   total_iter: 1000000
   max_grad_norm: 1.0
   adv_clip_max: 5
-  clip_range: 1e-3
-  # clip_range: 1e-2
+  # clip_range: 1e-4
+  clip_range: 1e-2
   kl_weight: 0.001
   num_batches_per_epoch: 2
 
@@ -95,7 +99,7 @@ val:
     # num_inference_steps: 50
     num_inference_steps: 10
     sample_size: 8
-    sample_steps_prob: 0.2
+    sample_steps_prob: 0.18
     sample_trajectory_per_video: 1
     use_kv_cache: true
   eval_cfg:

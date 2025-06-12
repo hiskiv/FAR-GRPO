@@ -39,8 +39,8 @@ models:
         }
         pretrained_path: /users/xiaokangliu/models/FAR_M_Long_Minecraft_Action128-4c041561.pth
       lora_config:
-        r: 8  # LoRA rank
-        alpha: 16  # LoRA scaling factor
+        r: 16  # LoRA rank
+        alpha: 32  # LoRA scaling factor
         dropout: 0.1
         target_modules: ["to_q", "to_k", "to_v", "to_out.0"]  # Target attention modules for LoRA
         bias: "none"
@@ -65,7 +65,7 @@ train:
 
   optim_g:
     type: AdamW
-    lr: !!float 1e-4
+    lr: !!float 1e-1
     weight_decay: 0
     betas: [ 0.9, 0.999 ]
 
@@ -91,9 +91,9 @@ val:
     # unroll_length: 56
     unroll_length: 11
     guidance_scale: 1.5
-    num_inference_steps: 50
+    num_inference_steps: 25
     sample_size: 8
-    sample_steps_prob: 0.5
+    sample_steps_prob: 1
     sample_trajectory_per_video: 1
     use_kv_cache: true
   eval_cfg:

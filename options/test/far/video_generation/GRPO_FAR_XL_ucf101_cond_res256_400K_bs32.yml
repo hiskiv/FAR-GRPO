@@ -1,4 +1,4 @@
-name: FAR_L_ucf101_cond_res256_400K_bs32
+name: FAR_XL_ucf101_cond_res256_400K_bs32
 manual_seed: 0
 mixed_precision: bf16
 
@@ -6,7 +6,7 @@ mixed_precision: bf16
 datasets:
   train:
     type: UCFDataset
-    data_list: /users/xiaokangliu/datasets/ucf101/trainval.json
+    data_list: datasets/ucf101/trainval.json
     split: training
     data_cfg:
       n_frames: 16
@@ -17,14 +17,14 @@ datasets:
 
   sample:
     type: UCFDataset
-    data_list: /users/xiaokangliu/datasets/ucf101/trainval.json
+    data_list: datasets/ucf101/trainval.json
     split: validation
     data_cfg:
       n_frames: 16
       resolution: 256
       frame_interval: 3
       evaluation_type: Latte
-    num_sample: 64
+    num_sample: 2048
     batch_size_per_gpu: 16
 
 models:
@@ -32,14 +32,14 @@ models:
     transformer:
       from_pretrained: ~ # diffusers pretrained path (from_pretrained)
       init_cfg:
-        type: FAR_L
+        type: FAR_XL
         config: {
           "condition_cfg": {
             "type": "label",
             "num_classes": 101
           }
         }
-        pretrained_path: experiments/pretrained_models/FAR_Models/video_generation/FAR_L_UCF101_Cond256-41c6033f.pth
+        pretrained_path: experiments/pretrained_models/FAR_Models/video_generation/FAR_XL_UCF101_Cond256-28a88f56.pth
     vae:
       type: MyAutoencoderDC
       from_config: options/model_cfg/dcae/model_32x_c32_config.json
@@ -75,7 +75,7 @@ train:
 # validation settings
 val:
   val_pipeline: FARPipeline
-  val_freq: 20000
+  val_freq: 50000
   sample_cfg:
     context_length: 0
     unroll_length: 16
@@ -89,5 +89,5 @@ val:
 # logging settings
 logger:
   print_freq: 100
-  save_checkpoint_freq: !!float 20000
+  save_checkpoint_freq: !!float 50000
   use_wandb: false

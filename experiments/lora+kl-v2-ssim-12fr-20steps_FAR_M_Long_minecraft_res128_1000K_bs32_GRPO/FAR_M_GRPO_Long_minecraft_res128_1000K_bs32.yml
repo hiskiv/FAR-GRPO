@@ -1,4 +1,8 @@
-name: lora+kl-v10-ssim-56fr-10steps_FAR_M_Long_minecraft_res128_1000K_bs32_GRPO
+# GENERATE TIME: Wed Jun  4 11:25:02 2025
+# CMD:
+# train_grpo.py -opt /users/xiaokangliu/projects/FAR-GRPO/options/train/far/long_video_prediction/FAR_M_GRPO_Long_minecraft_res128_1000K_bs32.yml
+
+name: lora+kl-v2-ssim-12fr-20steps_FAR_M_Long_minecraft_res128_1000K_bs32_GRPO
 manual_seed: 0
 mixed_precision: bf16
 
@@ -12,8 +16,8 @@ datasets:
     data_cfg:
       num_frames: 300
       frame_interval: 1
-    batch_size_per_gpu: 12
-    num_rollouts_per_prompt: 6 # currently for debug
+    batch_size_per_gpu: 16
+    num_rollouts_per_prompt: 8 # currently for debug
 
   sample:
     type: MinecraftDataset
@@ -39,10 +43,10 @@ models:
         }
         pretrained_path: /users/xiaokangliu/models/FAR_M_Long_Minecraft_Action128-4c041561.pth
       lora_config:
-        r: 32  # LoRA rank
-        alpha: 64  # LoRA scaling factor
+        r: 16  # LoRA rank
+        alpha: 32  # LoRA scaling factor
         dropout: 0.1
-        target_modules: ["to_q", "to_k", "to_v", "to_out.0", "add_k_proj", "add_q_proj", "add_v_proj", "to_add_out"]  # Target attention modules for LoRA
+        target_modules: ["to_q", "to_k", "to_v", "to_out.0"]  # Target attention modules for LoRA
         bias: "none"
         task_type: "FEATURE_EXTRACTION"
     vae:
@@ -65,37 +69,37 @@ train:
 
   optim_g:
     type: AdamW
-    lr: !!float 1e-4
-    weight_decay: 1e-4
+    lr: !!float 1e-3
+    weight_decay: 0
     betas: [ 0.9, 0.999 ]
 
   param_names_to_optimize: ~
   ema_decay: 0.9999
 
   lr_scheduler: constant_with_warmup
-  warmup_iter: 100
+  warmup_iter: 5000
   total_iter: 1000000
   max_grad_norm: 1.0
   adv_clip_max: 5
+  # clip_range: 1e-4
   clip_range: 1e-3
-  # clip_range: 1e-2
-  kl_weight: 0.001
+  kl_weight: 0.1
   num_batches_per_epoch: 2
 
 # validation settings
 val:
   val_pipeline: FARPipeline
-  val_freq: 4000
+  val_freq: 3000
   eval_on_start: false
   sample_cfg:
     context_length: 144
-    unroll_length: 56
-    # unroll_length: 12
+    # unroll_length: 56
+    unroll_length: 12
     guidance_scale: 1.5
     # num_inference_steps: 50
-    num_inference_steps: 10
+    num_inference_steps: 20
     sample_size: 8
-    sample_steps_prob: 0.2
+    sample_steps_prob: 1
     sample_trajectory_per_video: 1
     use_kv_cache: true
   eval_cfg:
@@ -103,6 +107,6 @@ val:
 
 # logging settings
 logger:
-  print_freq: 5
+  print_freq: 8
   save_checkpoint_freq: !!float 5000
   use_wandb: true
