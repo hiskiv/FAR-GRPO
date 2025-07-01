@@ -283,8 +283,14 @@ def train(args):
         # print('samples[0][rewards]', samples[0]['rewards'])
         # print('samples[0][advantages]', samples[0]['advantages'])
         if accelerator.is_main_process:
-            log_dict = {'rewards_mean': rewards_mean, 'rewards_std': rewards_std, 'lpips': reward_dict['lpips'].mean().item(), 'ssim': reward_dict['ssim'].mean().item()}
-            # log_dict = {'rewards_mean': rewards_mean, 'rewards_std': rewards_std, 'mse': reward_dict['mse'].mean().item()}
+            if opt['train']['reward'] == 'ssim':
+                log_dict = {'rewards_mean': rewards_mean, 'rewards_std': rewards_std, 'lpips': reward_dict['lpips'].mean().item(), 'ssim': reward_dict['ssim'].mean().item()}
+            elif opt['train']['reward'] == 'mse':
+                log_dict = {'rewards_mean': rewards_mean, 'rewards_std': rewards_std, 'mse': reward_dict['mse'].mean().item()}
+            elif opt['train']['reward'] == 'jpeg':
+                log_dict = {'rewards_mean': rewards_mean, 'rewards_std': rewards_std, 'jpeg': reward_dict['jpeg'].mean().item()}
+            elif opt['train']['reward'] == 'topk_patch_mse':
+                log_dict = {'rewards_mean': rewards_mean, 'rewards_std': rewards_std, 'topk_patch_mse': reward_dict['topk_patch_mse'].mean().item()}
             # msg_logger(log_dict)
             # print(log_dict)
             # print(reward_dict['mse'].shape)
@@ -346,11 +352,6 @@ def train(args):
                     if global_step % opt['logger']['print_freq'] == 0:
 
                         print(ratio_dict)
-                        if accelerator.is_main_process:
-                            print('30', [item for item in list(train_pipeline.model.named_parameters()) if 'lora' in item[0]][30][1].data.view(-1)[0].item())
-                            print('31', [item for item in list(train_pipeline.model.named_parameters()) if 'lora' in item[0]][31][1].data.view(-1)[0].item())
-                            print('30 base', [item for item in list(train_pipeline.model.named_parameters()) if not ('lora' in item[0])][30][1].data.view(-1)[0].item())
-                            print('31 base', [item for item in list(train_pipeline.model.named_parameters()) if not ('lora' in item[0])][31][1].data.view(-1)[0].item())
                         # print('log_dict', loss_dict)
                         log_dict = reduce_loss_dict(accelerator, loss_dict)
                         losses = reduce_loss_dict(accelerator, losses)
@@ -376,6 +377,7 @@ def train(args):
                     if global_step % opt['val']['val_freq'] == 0 or global_step == total_iter or (global_step in {2, 3} and opt['val']['eval_on_start']):
 
                         if sample_dataloader is not None:
+                            print("Sampling for evaluation")
                             train_pipeline.sample(sample_dataloader, opt, num_samples=2, wandb_logger=wandb_logger, global_step=global_step)
 
                         accelerator.wait_for_everyone()

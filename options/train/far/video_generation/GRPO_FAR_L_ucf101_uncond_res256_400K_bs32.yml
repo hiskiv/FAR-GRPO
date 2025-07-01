@@ -1,4 +1,4 @@
-name: ucfv5_16fr_10st_GRPO_FAR_L_ucf101_uncond_res256_400K_bs32
+name: ucfv7_jpeg_16fr_10st_GRPO_FAR_L_ucf101_uncond_res256_400K_bs32
 manual_seed: 0
 mixed_precision: bf16
 
@@ -78,6 +78,7 @@ train:
   # clip_range: 1e-2
   kl_weight: 0.001
   num_batches_per_epoch: 2
+  reward: jpeg
 
 # validation settings
 val:

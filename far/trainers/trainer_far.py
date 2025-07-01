@@ -15,7 +15,7 @@ from safetensors.torch import load_file
 from tqdm import tqdm
 from peft import get_peft_model, LoraConfig, TaskType
 
-from far.metrics.metric import VideoMetric
+from far.metrics.metric import VideoMetric, jpeg_compressibility, jpeg_incompressibility, topk_patch_mse
 from far.models import build_model
 from far.models.autoencoder_dc_model import MyAutoencoderDC
 from far.pipelines import build_pipeline
@@ -332,7 +332,7 @@ class FARTrainer:
 
 
     @torch.no_grad()
-    def sample(self, val_dataloader, opt, num_samples=2, wandb_logger=None, global_step=0):
+    def sample(self, val_dataloader, opt, num_samples=3, wandb_logger=None, global_step=0):
         model = self.accelerator.unwrap_model(self.model)
 
         if self.ema is not None:
@@ -483,6 +483,7 @@ class FARTrainer:
                 'guidance_scale': opt['val']['sample_cfg']['guidance_scale'],
                 'sample_size': opt['val']['sample_cfg']['sample_size'],
                 'sample_steps_prob': opt['val']['sample_cfg']['sample_steps_prob'],
+                'reward_type': opt['train']['reward'],
                 'prob_generator': g,
                 'use_kv_cache': opt['val']['sample_cfg'].get('use_kv_cache', True),
                 'kl_weight': opt['train']['kl_weight']
@@ -557,4 +558,9 @@ class FARTrainer:
         videos_gt = videos_gt[:, :, :total_frames]
         logger.info(f'evaluating: sample of shape {videos_sample.shape}, gt of shape {videos_gt.shape}')
         result_dict = video_metric.compute(videos_sample.contiguous(), videos_gt.contiguous(), context_length=context_length)
+        if opt['train']['reward'] == 'jpeg':
+            result_dict['jpeg'] = jpeg_compressibility(videos_sample.contiguous()[:, 0, context_length:]).mean()
+        elif opt['train']['reward'] == 'topk_patch_mse':
+            print("Computing topk_patch_mse")
+            result_dict['topk_patch_mse'] = -topk_patch_mse(videos_sample.contiguous()[:, 0, context_length:], videos_gt.contiguous()[:, 0, context_length:total_frames]).mean()
         return result_dict

@@ -12,7 +12,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from tqdm import tqdm
 
-from far.metrics.metric import VideoMetric
+from far.metrics.metric import VideoMetric, jpeg_compressibility, jpeg_incompressibility, topk_patch_mse
 from far.utils.registry import PIPELINE_REGISTRY
 
 def context_cache_to_device(context_cache, device):
@@ -333,6 +333,7 @@ class FARPipeline(DiffusionPipeline):
         context_sequence=None,
         gt_video=None,
         conditions=None,
+        reward_type: str = 'mse',
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         prob_generator: Optional[torch.Generator] = None,
         num_inference_steps: int = 50,
@@ -449,18 +450,33 @@ class FARPipeline(DiffusionPipeline):
         # reward computation
 
         # MSE reward
-        # reward = -torch.mean((videos[:, current_context_length:] - gt_video[:, current_context_length:current_context_length + unroll_length]) ** 2, dim=(1, 2, 3, 4), keepdim=False).unsqueeze(1) # Only the generated frames
-        # reward = -torch.mean((videos - gt_video[:, :current_context_length + unroll_length]) ** 2, dim=(1, 2, 3, 4), keepdim=False).unsqueeze(1) # all frames
-        # result_dict = {'mse': reward}
-
-        # FVD reward
-        result_dict = self.video_metric.compute_reward(videos.unsqueeze(1), gt_video[:, :current_context_length + unroll_length].unsqueeze(1), context_length=current_context_length)
-        # for sample in samples:
+        if reward_type == 'mse':
+            reward = -torch.mean((videos[:, current_context_length:] - gt_video[:, current_context_length:current_context_length + unroll_length]) ** 2, dim=(1, 2, 3, 4), keepdim=False).unsqueeze(1) # Only the generated frames
+            reward = -torch.mean((videos - gt_video[:, :current_context_length + unroll_length]) ** 2, dim=(1, 2, 3, 4), keepdim=False).unsqueeze(1) # all frames
+            result_dict = {'mse': reward}
+        # Quality reward
+        elif reward_type == 'ssim':
+            result_dict = self.video_metric.compute_reward(videos.unsqueeze(1), gt_video[:, :current_context_length + unroll_length].unsqueeze(1), context_length=current_context_length)
+        # Compressibility reward
+        elif reward_type == 'jpeg':
+            reward = jpeg_compressibility(videos[:, current_context_length:])
+            result_dict = {'jpeg': reward}
+        elif reward_type == 'topk_patch_mse':
+            reward = -topk_patch_mse(videos[:, current_context_length:], gt_video[:, current_context_length:current_context_length + unroll_length])
+            result_dict = {'topk_patch_mse': reward}
+        # print(reward)
+        # print(result_dict)
+        
         for i, sample in enumerate(samples):
-        #     # sample["rewards"] = -0.3 * result_dict['lpips'].to(self.execution_device) + 0.7 * result_dict['ssim'].to(self.execution_device)
-            sample["rewards"] = result_dict['ssim'].to(self.execution_device)
+            if reward_type == 'ssim':
+                sample["rewards"] = result_dict['ssim'].to(self.execution_device)
+            elif reward_type == 'mse':
+                sample["rewards"] = result_dict['mse'].to(self.execution_device)
+            elif reward_type == 'jpeg':
+                sample["rewards"] = result_dict['jpeg'].to(self.execution_device)
+            elif reward_type == 'topk_patch_mse':
+                sample["rewards"] = result_dict['topk_patch_mse'].to(self.execution_device)
         #     result_dict = {'mse': -torch.mean((videos[:, samples_args[i]['step']:samples_args[i]['step'] + 1] - gt_video[:, samples_args[i]['step']:samples_args[i]['step'] + 1]) ** 2, dim=(1, 2, 3, 4), keepdim=False).unsqueeze(1)}
-            # sample["rewards"] = result_dict['mse'].to(self.execution_device)
 
         return videos, samples, samples_args, result_dict
     
